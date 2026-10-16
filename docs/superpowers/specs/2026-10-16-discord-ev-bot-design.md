@@ -182,6 +182,14 @@ those commands manually. Automation should not silently perform git operations.
 
 ## 6. Architecture
 
+> **Phasing note.** This section describes the complete system. §10 splits it
+> into two phases: **phase 1 ships the poller path only** (§6.2–§6.5, §6.7) and
+> needs no hosting. The webhook receiver (§6.1), its bootstrap (§6.6), and the
+> enrichment join in §6.3 are **phase 2**. The "primary / secondary" labels
+> below describe the finished system; in phase 1 the poller is the only path,
+> and it carries `booksInConsensus` and `kellyFraction` natively, so no
+> enrichment is needed until webhooks exist.
+
 ```
                     ┌──────────────────────────────┐
                     │      Owls Insight API        │
@@ -481,6 +489,11 @@ would train the operator to skim exactly the channel that must be read.
 | Git/GitHub performed manually, as a teaching exercise | Operator |
 | Post-only in v1; bot token now, slash commands in v2 | Operator |
 | Operator registers the webhook endpoint by hand | Operator |
+| Run locally on this machine first, cloud-portable later | Operator |
+| Hosting is optional, not a prerequisite — open to it if simpler | Operator |
+| Phase 1 is poller-only: no receiver, no tunnel, no hosting | Claude |
+| Webhooks deferred to phase 2, where hosting is recommended over tunnelling | Claude |
+| 12-factor portability rules enforced from day one | Claude |
 | Webhooks as the primary signal path | Claude |
 | Schedule-gated polling as the secondary path | Claude |
 | Defer WebSocket to a later enrichment phase | Claude |
@@ -538,6 +551,136 @@ would train the operator to skim exactly the channel that must be read.
 4. **`ev.found` sends no backfill.** "Only the crossings that come after"
    registration. The channel is silent after deploy until a new crossing; the
    poller covers the current board.
+
+---
+
+## 10. Deployment: two phases
+
+**Operator requirement:** run on this Mac now; movable to cloud later. The
+operator is unsure about hosting mechanics and cost, so phase 1 is designed to
+need none.
+
+### The asymmetry that makes this easy
+
+Only **one** component needs inbound connectivity: the webhook receiver.
+Everything else is outbound-only and works on any laptop behind any NAT:
+
+| Component | Direction | Works locally? |
+|---|---|---|
+| REST poller → `api.owlsinsight.com` | outbound HTTPS | **yes** |
+| Discord publisher → Discord gateway | outbound WSS | **yes** |
+| Webhook receiver ← Owls Insight | **inbound HTTPS** | **no** |
+
+Webhook delivery cannot reach localhost: the API refuses IP addresses, private
+and reserved addresses, and internal hostnames, at registration *and on every
+delivery*. No local configuration changes this.
+
+### Phase 1 — local, no hosting, no tunnel
+
+**Poller-only.** A complete, useful bot that runs with `cargo run` on this Mac
+and needs no public address, no tunnel, and no hosting spend.
+
+It is not a degraded version. REST `/ev?venues=true` returns **every** book,
+so phase 1 covers all seven viable venues — **one more than webhooks can**,
+since `ev.found` refuses Polymarket. The only loss is latency: alerts arrive
+within one poll interval (60s) instead of on push.
+
+It is also **materially simpler**, because the enrichment subsystem disappears.
+Enrichment existed only to recover `booksInConsensus` and `kellyFraction`, which
+the thin webhook payload omits — REST carries both natively. Phase 1 is
+therefore:
+
+```
+poller → dedupe → Discord publisher
+```
+
+No HMAC verification, no raw-body handling, no receiver, no public URL, no
+enrichment join, no tunnel.
+
+### Phase 2 — add webhooks, which needs hosting
+
+Adds the `axum` receiver and §6.1's signature verification for push-latency
+alerts on the six webhook-eligible books. The poller **remains** — it is still
+Polymarket's only path and the dropped-delivery safety net.
+
+This phase requires a public HTTPS hostname. Two ways to get one:
+
+**Host it (recommended).** A small always-on instance provides the hostname
+natively and deletes the tunnel as a moving part.
+
+| Option | Approx. cost | Notes |
+|---|---|---|
+| **Fly.io** | ~$2–4/mo | `shared-cpu-1x`, 256MB. Free `*.fly.dev` HTTPS. Needs a Dockerfile. Fine-grained cost control. |
+| **Railway** | ~$5/mo | Deploys from GitHub, auto-TLS, `*.up.railway.app`. Gentlest path. |
+| **Render** | ~$7/mo | **Its free tier spins down when idle — fatal for a webhook receiver.** Paid tier only. |
+| **Hetzner / DO VPS** | ~$4–6/mo | Self-managed: OS updates, TLS via Caddy. Most learning, most work. |
+
+Verify current pricing before committing; these move. A Rust binary at ~256MB
+RAM sits at the bottom of every pricing tier, which is a real cost advantage
+over a Python equivalent here.
+
+**Or tunnel from this Mac.** Keeps compute local. Needs a *stable* hostname —
+if the URL rotates per restart, each restart needs a
+`PATCH /api/v1/webhooks/{id}`, and a forgotten PATCH means silent alert loss
+with no error anywhere.
+
+| Option | Stable hostname | Notes |
+|---|---|---|
+| **Tailscale Funnel** | yes, free | Stable `*.ts.net`, no domain needed. Lowest setup cost. |
+| **Cloudflare Tunnel** (named) | yes, free | Needs a domain on Cloudflare. Ephemeral `trycloudflare` URLs rotate — avoid. |
+| ngrok free | **no** | Rotates per restart. Static domains are paid. |
+
+Neither is installed; Homebrew is available. Note the tunnel also requires this
+Mac to be awake and online whenever a game is pre-start, which hosting does not.
+
+### Portability rules — follow from day one
+
+The cloud move is only cheap if nothing local leaks into the code:
+
+- **Config from file + env override.** No machine-specific absolute paths.
+- **Bind address and port from env** (`BIND_ADDR`, `PORT`). Never hardcode.
+- **Public URL is config, not derived.** The webhook URL the bot reports and
+  reconciles must come from config, because locally it is a tunnel hostname and
+  in cloud it is the service's own.
+- **Logs to stdout**, structured. No log files — every cloud platform captures
+  stdout and nothing captures your local files.
+- **Graceful shutdown on SIGTERM.** Cloud platforms send it before stopping a
+  container; draining the publisher queue on signal prevents losing queued
+  alerts on every deploy.
+- **A health endpoint** (`GET /healthz`) returning 200 when the receiver is
+  live. Cloud platforms need it for liveness checks; locally it is how you
+  confirm the tunnel is wired up.
+- **State directory from config**, defaulting to something relative. If
+  persistence is added (see below), it must not assume a macOS path.
+
+### Dev loop vs deployment artifact
+
+Run natively with `cargo run` for development — containerizing the inner loop
+adds rebuild latency for no benefit while iterating. Add a **multi-stage
+Dockerfile** as the deployment artifact. Because the rules above make the binary
+environment-agnostic, the Dockerfile is additive and can land late without
+reshaping anything.
+
+### Persistence
+
+§8 leaves the mechanism to the builder. The local-first requirement narrows it:
+whatever is chosen must move with the service. **SQLite** (single file, no
+separate process, no network dependency) is the portable choice if the dedupe
+set and enrichment cache need to survive restart. In-memory remains acceptable
+for v1 — cold start already seeds silently, so a restart loses suppression state
+and re-seeds rather than spamming.
+
+Avoid anything requiring a separate managed service in v1; that converts a
+one-machine move into a multi-service migration.
+
+### Eventual cloud target
+
+Worth stating plainly: a small always-on cloud instance (Fly.io, Railway,
+Render) provides the public HTTPS hostname the API demands **natively**, which
+deletes the tunnel entirely. The tunnel exists only to satisfy the local-first
+requirement. When the move happens, the change is: point `PUBLIC_URL` at the new
+host, `PATCH` the webhook `url`, done — provided the portability rules above
+were followed.
 
 ---
 
