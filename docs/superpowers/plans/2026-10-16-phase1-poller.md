@@ -735,7 +735,21 @@ git commit -m "feat: Discord embed builder and newest-wins publish queue"
 
 **Interfaces:**
 - Consumes: `OwlsClient` (3), `active_sports` (4), `is_publishable` (5), `Suppressor` (6), `Alert` sender (7).
-- Produces: `async fn poll_once(ctx: &mut PollContext, now: DateTime<Utc>) -> Result<PollOutcome, OwlsError>`; `struct PollContext { client, cfg, suppressor, tx, active: BTreeSet<String>, seeded: HashSet<String>, venue_sports: HashSet<String> }`; `PollOutcome { polled: usize, published: usize, suppressed: usize }`; `fn next_interval(base: Duration, q: &QuotaSnapshot, day_of_month: u32) -> Duration`.
+- Produces: `async fn poll_once(ctx: &mut PollContext, cfg: &Config, now_wall: DateTime<Utc>, now_mono: Instant) -> Result<PollOutcome, OwlsError>`; `struct PollContext { client, suppressor, tx, active: BTreeSet<String>, seeded: HashSet<String>, venue_sports: HashSet<String> }`; `PollOutcome { polled: usize, published: usize, suppressed: usize }`; `fn next_interval(base: Duration, q: &QuotaSnapshot, day_of_month: u32) -> Duration`.
+
+**Pre-flight Ruling 1 — two clocks, deliberately.** `now_wall` is compared
+against `commence_time` for gating; `now_mono` is passed to `Suppressor`, which
+measures the 2-hour window and must be immune to NTP steps and DST. `Instant`
+and `DateTime<Utc>` are not interconvertible, so both are parameters rather than
+one being derived from the other. Task 9's `silence_warning` already takes
+`Instant` for the same reason.
+
+**Pre-flight Ruling 2 — `cfg` is a parameter, not state.** `Config` is
+deliberately *not* a field of `PollContext`. Task 10 hot-reloads config through
+a `watch` channel; a snapshot captured in `PollContext` at boot would silently
+ignore every later change and freeze the operator's threshold — defeating the
+spec's runtime-changeability requirement. The caller reads the current value and
+passes it in on each poll.
 
 - [ ] **Step 1: Write the failing tests**
 
