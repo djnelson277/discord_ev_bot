@@ -4,3 +4,5 @@
 //! address. See docs/superpowers/specs/ for the design.
 
 pub mod config;
+
+pub mod owls;
