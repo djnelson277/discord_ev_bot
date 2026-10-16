@@ -1,0 +1,9 @@
+[package]
+name = "discord_ev_bot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+figment = { version = "0.10.19", features = ["toml", "env"] }
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.21"

@@ -1,0 +1,27 @@
+# Operator criteria. Every value here is changeable at runtime.
+# Env vars prefixed EVBOT_ override these (e.g. EVBOT_MIN_EV_PCT=5.0).
+
+owls_base_url = "https://api.owlsinsight.com"
+
+# Alert only on EV strictly greater than this, in percent.
+min_ev_pct = 3.5
+
+poll_interval_secs = 60
+gating_refresh_secs = 3600
+
+# A sport is "active" if it has an unstarted game within this many hours.
+lookahead_hours = 48
+
+sports = [
+  "nfl", "nba", "mlb", "nhl", "ncaaf",
+  "ncaab", "wnba", "soccer", "tennis", "mma",
+]
+
+books = [
+  "betmgm", "fanduel", "draftkings", "bet365",
+  "novig", "kalshi", "polymarket",
+]
+
+# Optional. When set, opportunities with a known lower consensus count are
+# rejected. An absent count always publishes (fail open, marked).
+# min_books_in_consensus = 2
