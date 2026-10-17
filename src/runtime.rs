@@ -222,6 +222,7 @@ pub async fn run(
 
     let mut gating_due = Instant::now();
     let mut health_due = Instant::now();
+    let started_at = Instant::now();
     let mut last_alert: Option<Instant> = None;
 
     while !shutdown.is_cancelled() {
@@ -260,7 +261,13 @@ pub async fn run(
         if Instant::now() >= health_due {
             for warning in [
                 quota_warning(&quota, day, QUOTA_WARN_AT),
-                silence_warning(last_alert, &ctx.active, SILENCE_THRESHOLD, Instant::now()),
+                silence_warning(
+                    last_alert,
+                    started_at,
+                    &ctx.active,
+                    SILENCE_THRESHOLD,
+                    Instant::now(),
+                ),
             ]
             .into_iter()
             .flatten()

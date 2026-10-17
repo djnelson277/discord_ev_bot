@@ -79,9 +79,14 @@ pub fn quota_warning(q: &QuotaSnapshot, day_of_month: u32, warn_at: f64) -> Opti
 /// would cry wolf nightly. An ops channel that cries wolf is one nobody reads
 /// when it matters.
 ///
-/// `last_alert` of `None` means nothing has been published since boot.
+/// `last_alert` of `None` means nothing has been published since boot, in which
+/// case silence is measured from `started_at`. That distinction is not academic:
+/// treating `None` as "maximally quiet" made the bot post a false "the poller
+/// has stopped" alarm on every single startup, which is precisely the
+/// cry-wolf failure this function exists to avoid. Found by running it.
 pub fn silence_warning(
     last_alert: Option<Instant>,
+    started_at: Instant,
     active: &BTreeSet<String>,
     threshold: Duration,
     now: Instant,
@@ -90,11 +95,10 @@ pub fn silence_warning(
         return None;
     }
 
-    let quiet_for = match last_alert {
-        Some(t) => now.saturating_duration_since(t),
-        // Nothing since boot. Treat the whole live window as the quiet period.
-        None => threshold,
-    };
+    // With nothing published yet, the clock runs from process start -- a bot up
+    // for five seconds has not been silent for an hour.
+    let since = last_alert.unwrap_or(started_at);
+    let quiet_for = now.saturating_duration_since(since);
 
     if quiet_for < threshold {
         return None;
@@ -116,12 +120,14 @@ mod tests {
 
     #[test]
     fn an_empty_active_set_silences_the_silence_warning() {
+        let now = Instant::now();
         assert!(
             silence_warning(
                 None,
+                now - Duration::from_secs(99_999),
                 &BTreeSet::new(),
                 Duration::from_secs(0),
-                Instant::now()
+                now
             )
             .is_none(),
             "no slate means no fault, even with a zero threshold"

@@ -75,7 +75,17 @@ fn no_silence_warning_when_nothing_is_in_season() {
     // timer would cry wolf every night, and an ops channel that cries wolf is
     // one nobody reads when it matters.
     let quiet = BTreeSet::new();
-    assert!(silence_warning(None, &quiet, Duration::from_secs(3600), Instant::now()).is_none());
+    let now = Instant::now();
+    assert!(
+        silence_warning(
+            None,
+            now - Duration::from_secs(99_999),
+            &quiet,
+            Duration::from_secs(3600),
+            now
+        )
+        .is_none()
+    );
 }
 
 #[test]
@@ -85,6 +95,7 @@ fn no_silence_warning_before_the_threshold_elapses() {
     assert!(
         silence_warning(
             Some(recent),
+            now - Duration::from_secs(99_999),
             &active(&["nba"]),
             Duration::from_secs(3600),
             now
@@ -99,6 +110,7 @@ fn warns_on_long_silence_while_a_slate_is_live() {
     let long_ago = now - Duration::from_secs(7200);
     let w = silence_warning(
         Some(long_ago),
+        now - Duration::from_secs(99_999),
         &active(&["nba", "nhl"]),
         Duration::from_secs(3600),
         now,
@@ -108,10 +120,39 @@ fn warns_on_long_silence_while_a_slate_is_live() {
 }
 
 #[test]
-fn warns_when_a_slate_is_live_and_nothing_has_ever_been_sent() {
-    // None means no alert since boot. With games live past the threshold that
-    // is worth reporting -- it is the shape a silently broken bot takes.
+fn does_not_cry_wolf_at_startup() {
+    // Found by running the binary: `last_alert: None` at boot was treated as
+    // "maximally quiet", so the bot posted a false "the poller has stopped"
+    // alarm on EVERY start. Silence must be measured from process start, not
+    // from the beginning of time.
     let now = Instant::now();
-    let w = silence_warning(None, &active(&["nba"]), Duration::from_secs(0), now);
-    assert!(w.is_some());
+    let just_started = now - Duration::from_secs(5);
+    assert!(
+        silence_warning(
+            None,
+            just_started,
+            &active(&["nba", "nhl"]),
+            Duration::from_secs(3600),
+            now
+        )
+        .is_none(),
+        "a freshly started bot has not been silent for an hour"
+    );
+}
+
+#[test]
+fn warns_when_nothing_has_been_sent_since_a_long_ago_start() {
+    // Still reports the genuine case: up for hours, games live, nothing sent.
+    let now = Instant::now();
+    let started_long_ago = now - Duration::from_secs(7200);
+    assert!(
+        silence_warning(
+            None,
+            started_long_ago,
+            &active(&["nba"]),
+            Duration::from_secs(3600),
+            now
+        )
+        .is_some()
+    );
 }
