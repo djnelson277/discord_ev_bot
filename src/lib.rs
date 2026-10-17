@@ -16,3 +16,5 @@ pub mod dedupe;
 pub mod discord;
 
 pub mod poller;
+
+pub mod obs;
