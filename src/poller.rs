@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
@@ -18,7 +18,14 @@ use crate::discord::Alert;
 use crate::discord::publisher::AlertQueue;
 use crate::filter::{Verdict, is_enriched, is_publishable};
 use crate::owls::client::OwlsClient;
+use crate::owls::error::OwlsError;
 use crate::owls::models::Kind;
+
+/// Cap on how long a single 429 may stall the pass. The API's own waits are
+/// short (2s for the concurrency and history caps); a longer one means quota
+/// trouble, which the governor handles on the next cycle rather than by
+/// blocking here.
+const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(10);
 
 /// Mutable state carried across polls.
 ///
@@ -54,6 +61,8 @@ pub struct PollOutcome {
     pub seeded: usize,
     pub stale_boards: usize,
     pub errors: usize,
+    /// Sports skipped this cycle because the API asked us to back off.
+    pub rate_limited: usize,
 }
 
 /// One pass over the active sports.
@@ -72,6 +81,13 @@ pub async fn poll_once(ctx: &mut PollContext, cfg: &Config, now_mono: Instant) -
     // by `is_publishable`, since the API only accepts whole-number min_ev.
     let server_min_ev = cfg.min_ev_pct.floor();
 
+    // Drop suppression state and seeding for sports that have left the gating
+    // set. Scoped ageing means their keys would otherwise never be aged again
+    // (a slow leak across a season), and clearing `seeded` makes a returning
+    // sport re-seed silently rather than republish its whole board.
+    ctx.suppressor.retain_sports(&ctx.active);
+    ctx.seeded.retain(|s| ctx.active.contains(s));
+
     let sports: Vec<String> = ctx.active.iter().cloned().collect();
 
     for sport in sports {
@@ -79,7 +95,22 @@ pub async fn poll_once(ctx: &mut PollContext, cfg: &Config, now_mono: Instant) -
             Ok(b) => b,
             Err(err) => {
                 out.errors += 1;
-                warn!(sport, error = %err, "EV poll failed; continuing with other sports");
+                // Honour Retry-After rather than immediately hammering the same
+                // account with the next sport's request. A 429 from the burst
+                // limiter stays tripped if we keep pushing; a 429 from quota
+                // exhaustion means every further request is spent for nothing.
+                if let OwlsError::RateLimited { retry_after } = &err {
+                    let wait = (*retry_after).min(MAX_RATE_LIMIT_WAIT);
+                    warn!(
+                        sport,
+                        wait_secs = wait.as_secs_f64(),
+                        "rate limited; waiting as instructed before the next sport"
+                    );
+                    out.rate_limited += 1;
+                    tokio::time::sleep(wait).await;
+                } else {
+                    warn!(sport, error = %err, "EV poll failed; continuing with other sports");
+                }
                 continue;
             }
         };
@@ -116,6 +147,7 @@ pub async fn poll_once(ctx: &mut PollContext, cfg: &Config, now_mono: Instant) -
                 }
 
                 let key = AlertKey {
+                    sport: sport.clone(),
                     event_id: event.dedupe_key(),
                     book: opp.book.clone(),
                     side: opp.side,
@@ -143,9 +175,10 @@ pub async fn poll_once(ctx: &mut PollContext, cfg: &Config, now_mono: Instant) -
             }
         }
 
-        // Age keys for this sport's observations. Done per sport so one sport's
-        // board does not look like an absence for another's keys.
-        ctx.suppressor.mark_absent(&seen_this_poll);
+        // Age only THIS sport's keys. An unscoped call would age every other
+        // sport's keys once per sport polled, evicting them inside a single
+        // cycle at three or more active sports and collapsing suppression.
+        ctx.suppressor.mark_absent_in_sport(&sport, &seen_this_poll);
 
         if seeding {
             ctx.seeded.insert(sport.clone());

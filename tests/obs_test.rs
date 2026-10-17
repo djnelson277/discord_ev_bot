@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use discord_ev_bot::obs::{quota_warning, silence_warning};
-use discord_ev_bot::owls::quota::{MONTHLY_QUOTA_MVP, QuotaSnapshot};
+use discord_ev_bot::owls::quota::{MONTHLY_QUOTA_MVP, Pacing, QuotaSnapshot};
 
 fn healthy() -> QuotaSnapshot {
     QuotaSnapshot {
@@ -10,6 +10,15 @@ fn healthy() -> QuotaSnapshot {
         remaining_month: Some(MONTHLY_QUOTA_MVP),
         unlimited_month: false,
         reset_minute_unix_ms: None,
+    }
+}
+
+fn pacing(active_sports: usize, day_of_month: u32) -> Pacing {
+    Pacing {
+        base: Duration::from_secs(60),
+        day_of_month,
+        active_sports,
+        has_venue_sports: false,
     }
 }
 
@@ -26,7 +35,7 @@ fn warns_when_burn_rate_outpaces_the_month() {
         remaining_month: Some(30_000),
         ..healthy()
     };
-    let w = quota_warning(&q, 10, 0.8).expect("should warn");
+    let w = quota_warning(&q, pacing(10, 10), 0.8).expect("should warn");
     assert!(
         w.contains("30000") || w.contains("30,000") || w.contains('%'),
         "got: {w}"
@@ -39,7 +48,7 @@ fn silent_when_spending_is_on_pace() {
         remaining_month: Some(200_000),
         ..healthy()
     };
-    assert!(quota_warning(&q, 10, 0.8).is_none());
+    assert!(quota_warning(&q, pacing(5, 10), 0.8).is_none());
 }
 
 #[test]
@@ -49,13 +58,13 @@ fn unlimited_plans_never_warn_about_quota() {
         unlimited_month: true,
         ..healthy()
     };
-    assert!(quota_warning(&q, 28, 0.8).is_none());
+    assert!(quota_warning(&q, pacing(10, 28), 0.8).is_none());
 }
 
 #[test]
 fn unknown_budget_does_not_warn() {
     // No headers yet is not a problem to report.
-    assert!(quota_warning(&QuotaSnapshot::default(), 15, 0.8).is_none());
+    assert!(quota_warning(&QuotaSnapshot::default(), pacing(10, 15), 0.8).is_none());
 }
 
 #[test]
@@ -64,7 +73,7 @@ fn exhausted_budget_warns_regardless_of_day() {
         remaining_month: Some(0),
         ..healthy()
     };
-    assert!(quota_warning(&q, 2, 0.8).is_some());
+    assert!(quota_warning(&q, pacing(10, 2), 0.8).is_some());
 }
 
 // ---------------------------------------------------------- silence warnings
@@ -155,4 +164,28 @@ fn warns_when_nothing_has_been_sent_since_a_long_ago_start() {
         )
         .is_some()
     );
+}
+
+#[test]
+fn the_quota_warning_speaks_on_the_last_day_of_the_cycle() {
+    // REGRESSION (review finding #3). quota_warning had its own
+    // `expected <= 0.0` guard, so on day 30 it returned None no matter how
+    // little budget was left -- going silent on exactly the day it mattered.
+    // It is now tied to the governor's own decision, so the two cannot disagree.
+    let q = QuotaSnapshot {
+        remaining_month: Some(500),
+        ..healthy()
+    };
+    assert!(quota_warning(&q, pacing(10, 30), 0.8).is_some());
+}
+
+#[test]
+fn the_quota_warning_tracks_the_governor() {
+    // Healthy budget, modest plan: the governor is not degrading, so there is
+    // nothing to tell the operator.
+    let q = QuotaSnapshot {
+        remaining_month: Some(250_000),
+        ..healthy()
+    };
+    assert!(quota_warning(&q, pacing(3, 5), 0.8).is_none());
 }

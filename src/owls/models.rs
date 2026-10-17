@@ -188,6 +188,22 @@ pub enum Side {
     Draw,
 }
 
+/// Maps an unrecognised `kind` to `None` instead of failing the whole response.
+///
+/// `Side` is deliberately NOT lenient: sides are genuinely closed for a
+/// moneyline market, and an alert naming the wrong team is worse than no alert.
+fn lenient_kind<'de, D>(d: D) -> Result<Option<Kind>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Option<String> = Option::deserialize(d)?;
+    Ok(raw.and_then(|s| match s.as_str() {
+        "book" => Some(Kind::Book),
+        "venue" => Some(Kind::Venue),
+        _ => None,
+    }))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
@@ -226,7 +242,11 @@ pub struct Opportunity {
     /// `1` means Pinnacle alone. A `number` in the schema, so f64.
     #[serde(default)]
     pub books_in_consensus: Option<f64>,
-    #[serde(default)]
+    /// Unknown values deserialize to `None` rather than failing. A closed enum
+    /// here made ONE unrecognised value a hard error for the entire board, so a
+    /// new venue type on Owls' side would blind the bot indefinitely. `None`
+    /// takes the stricter 4% trade bar, so tolerance cannot loosen anything.
+    #[serde(default, deserialize_with = "lenient_kind")]
     pub kind: Option<Kind>,
     /// The fair before the 1-point safety margin.
     #[serde(default)]

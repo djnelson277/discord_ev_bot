@@ -30,6 +30,23 @@ pub const ALLOWED_BOOKS: [&str; 7] = [
     "polymarket",
 ];
 
+/// Floor on the poll interval. A zero or near-zero value turns the main loop
+/// into a tight request loop: measured at ~32,000 requests/minute against a
+/// mock, which against the live API is instant rate limiting and the whole
+/// monthly quota inside a day.
+pub const MIN_POLL_INTERVAL_SECS: u64 = 5;
+
+/// Floor on the gating refresh. Gating costs three requests; refreshing it
+/// every second would spend more than the polling it exists to economise.
+pub const MIN_GATING_REFRESH_SECS: u64 = 60;
+
+/// The server drops any EV above this as a data error, so a threshold above it
+/// can never match and would silence the bot entirely.
+pub const MAX_SENSIBLE_MIN_EV_PCT: f64 = 25.0;
+
+/// Ten days. Beyond this the schedule endpoint's own build window runs out.
+pub const MAX_LOOKAHEAD_HOURS: i64 = 240;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("config file not found: {0}")]
@@ -40,6 +57,20 @@ pub enum ConfigError {
     UnknownSport { sport: String },
     #[error("unknown book {book:?} — configured books must be among: {}", ALLOWED_BOOKS.join(", "))]
     UnknownBook { book: String },
+    #[error("{field} must be at least {min}, got {got}")]
+    TooSmall {
+        field: &'static str,
+        min: String,
+        got: String,
+    },
+    #[error("{field} must be at most {max}, got {got}")]
+    TooLarge {
+        field: &'static str,
+        max: String,
+        got: String,
+    },
+    #[error("{field} must not be empty — an empty list silently disables the bot")]
+    Empty { field: &'static str },
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -65,10 +96,10 @@ pub struct Config {
     #[serde(default = "default_lookahead_hours")]
     pub lookahead_hours: i64,
 
-    #[serde(default)]
+    #[serde(default = "default_sports")]
     pub sports: Vec<String>,
 
-    #[serde(default)]
+    #[serde(default = "default_books")]
     pub books: Vec<String>,
 
     /// When set, reject opportunities whose consensus count is known and lower.
@@ -95,6 +126,17 @@ fn default_gating_refresh() -> u64 {
 }
 fn default_lookahead_hours() -> i64 {
     48
+}
+fn default_sports() -> Vec<String> {
+    [
+        "nfl", "nba", "mlb", "nhl", "ncaaf", "ncaab", "wnba", "soccer", "tennis", "mma",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+fn default_books() -> Vec<String> {
+    ALLOWED_BOOKS.iter().map(|s| s.to_string()).collect()
 }
 
 impl Config {
@@ -123,6 +165,62 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        // Bounds first: a zero interval is the one misconfiguration that can
+        // burn the whole monthly quota before anyone notices, and the
+        // hot-reload path runs this same validation, so a mid-slate typo is
+        // rejected rather than applied.
+        if self.poll_interval_secs < MIN_POLL_INTERVAL_SECS {
+            return Err(ConfigError::TooSmall {
+                field: "poll_interval_secs",
+                min: MIN_POLL_INTERVAL_SECS.to_string(),
+                got: self.poll_interval_secs.to_string(),
+            });
+        }
+        if self.gating_refresh_secs < MIN_GATING_REFRESH_SECS {
+            return Err(ConfigError::TooSmall {
+                field: "gating_refresh_secs",
+                min: MIN_GATING_REFRESH_SECS.to_string(),
+                got: self.gating_refresh_secs.to_string(),
+            });
+        }
+        if self.lookahead_hours < 1 {
+            return Err(ConfigError::TooSmall {
+                field: "lookahead_hours",
+                min: "1".into(),
+                got: self.lookahead_hours.to_string(),
+            });
+        }
+        if self.lookahead_hours > MAX_LOOKAHEAD_HOURS {
+            return Err(ConfigError::TooLarge {
+                field: "lookahead_hours",
+                max: MAX_LOOKAHEAD_HOURS.to_string(),
+                got: self.lookahead_hours.to_string(),
+            });
+        }
+        if !self.min_ev_pct.is_finite() || self.min_ev_pct < 0.0 {
+            return Err(ConfigError::TooSmall {
+                field: "min_ev_pct",
+                min: "0".into(),
+                got: self.min_ev_pct.to_string(),
+            });
+        }
+        if self.min_ev_pct > MAX_SENSIBLE_MIN_EV_PCT {
+            return Err(ConfigError::TooLarge {
+                field: "min_ev_pct",
+                max: MAX_SENSIBLE_MIN_EV_PCT.to_string(),
+                got: self.min_ev_pct.to_string(),
+            });
+        }
+        // An empty list is not a permissive default, it is a silent off switch:
+        // no sports means nothing is polled, no books means everything is
+        // rejected, and an empty active set also mutes the silence alarm.
+        if self.sports.is_empty() {
+            return Err(ConfigError::Empty { field: "sports" });
+        }
+        if self.books.is_empty() {
+            return Err(ConfigError::Empty { field: "books" });
+        }
+
         if let Some(sport) = self
             .sports
             .iter()

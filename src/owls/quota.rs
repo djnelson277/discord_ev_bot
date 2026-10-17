@@ -32,46 +32,96 @@ impl QuotaSnapshot {
     }
 }
 
-/// The MVP tier's monthly request allowance. Used as the denominator for burn
-/// pacing; a plan change makes this a config value rather than a constant.
+/// The MVP tier's monthly request allowance.
+///
+/// A compile-time constant because the operator is on MVP. A different plan
+/// makes the burn warning wrong by a constant factor, so this moves to config
+/// if the plan ever changes.
 pub const MONTHLY_QUOTA_MVP: u64 = 300_000;
 
-/// Days assumed in a month for pacing. The quota resets on the billing date
-/// rather than the 1st, so this is an approximation by design — it only needs
-/// to be good enough to notice spending twice as fast as sustainable.
-const DAYS_IN_MONTH: f64 = 30.0;
+/// Days assumed in a billing cycle for pacing.
+///
+/// The quota resets on the billing date rather than the 1st, so pacing keyed to
+/// the calendar day can be out of phase by up to a few weeks: slightly lax just
+/// after a mid-month reset, slightly strict just before one. Acceptable because
+/// the governor only has to prevent exhaustion, not optimise spend.
+const DAYS_IN_CYCLE: f64 = 30.0;
 
 /// Never slow the poller by more than this factor, however depleted the budget.
 /// An unbounded multiplier would silently turn the bot off, which is the
 /// silent-failure anti-goal; running slowly and warning is strictly better.
-const MAX_DEGRADATION: u32 = 8;
+const MAX_DEGRADATION: f64 = 8.0;
 
-/// The poll interval to use next, given how much of the month's budget remains.
+/// Seconds in a day, for projecting daily request spend.
+const SECS_PER_DAY: f64 = 86_400.0;
+
+/// Hard ceiling on the poll interval while any active sport carries exchange or
+/// prediction-market prices.
 ///
-/// Returns `base` unchanged when spending is on pace, when the plan has no
-/// monthly cap, or when the budget is simply unknown (before the first response
-/// there are no headers, and degrading on no information would slow the bot for
-/// nothing).
-pub fn next_interval(
-    base: std::time::Duration,
-    q: &QuotaSnapshot,
-    day_of_month: u32,
-) -> std::time::Duration {
-    if q.unlimited_month {
-        return base;
+/// `venues=true` quotes are warm-on-demand: they appear ~15s after you start
+/// asking and stay live only "while you keep asking". Stretching past this
+/// switches them **off** rather than merely making them stale, which silently
+/// loses Kalshi and Polymarket — and Polymarket is the one configured book the
+/// poller is the sole source for, since webhooks refuse it.
+pub const VENUE_MAX_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Everything the pacing decision needs besides the quota reading.
+#[derive(Debug, Clone, Copy)]
+pub struct Pacing {
+    /// The operator's configured interval.
+    pub base: std::time::Duration,
+    pub day_of_month: u32,
+    /// How many sports this cycle will poll. Each one is a request.
+    pub active_sports: usize,
+    /// Whether any active sport has shown an exchange or prediction-market
+    /// price, which imposes [`VENUE_MAX_INTERVAL`].
+    pub has_venue_sports: bool,
+}
+
+/// The poll interval to use next.
+///
+/// **Predictive, not reactive.** It projects what the configured interval would
+/// spend over the days left in the cycle and slows down if that exceeds the
+/// remaining budget. The earlier reactive version only engaged once spending
+/// had already fallen behind pace — by which point the correction was ~1.0 —
+/// and let 8-10 active sports exhaust the month around day 29.
+///
+/// Returns `base` unchanged when the plan has no monthly cap, when the budget is
+/// unknown (no headers yet, and degrading on no information slows the bot for
+/// nothing), and when nothing is active so there is no spend to pace.
+pub fn next_interval(q: &QuotaSnapshot, p: Pacing) -> std::time::Duration {
+    let mut interval = p.base;
+
+    if !q.unlimited_month && p.active_sports > 0 {
+        if let Some(remaining) = q.remaining_month {
+            // At least one day, so the final day of the cycle still paces --
+            // the old `expected <= 0` guard made the governor switch itself off
+            // on exactly the day it was most needed.
+            let days_left = (DAYS_IN_CYCLE - f64::from(p.day_of_month)).max(1.0);
+            let affordable_per_day = remaining as f64 / days_left;
+
+            let base_secs = p.base.as_secs_f64().max(1.0);
+            let needed_per_day = (SECS_PER_DAY / base_secs) * p.active_sports as f64;
+
+            if needed_per_day > affordable_per_day && affordable_per_day > 0.0 {
+                let factor = (needed_per_day / affordable_per_day).clamp(1.0, MAX_DEGRADATION);
+                interval = p.base.mul_f64(factor);
+            } else if affordable_per_day <= 0.0 {
+                interval = p.base.mul_f64(MAX_DEGRADATION);
+            }
+        }
     }
-    let Some(remaining) = q.remaining_month else {
-        return base;
-    };
 
-    let elapsed_fraction = (f64::from(day_of_month) / DAYS_IN_MONTH).clamp(0.0, 1.0);
-    let expected = MONTHLY_QUOTA_MVP as f64 * (1.0 - elapsed_fraction);
-
-    // Ahead of pace, or so late in the month that nothing is expected to remain.
-    if expected <= 0.0 || remaining as f64 >= expected {
-        return base;
+    if p.has_venue_sports {
+        // A ceiling on degradation, never a speed-up: max() of the base keeps a
+        // deliberately slow configured interval intact.
+        interval = interval.min(VENUE_MAX_INTERVAL.max(p.base));
     }
 
-    let factor = (expected / remaining.max(1) as f64).clamp(1.0, f64::from(MAX_DEGRADATION));
-    base.mul_f64(factor)
+    interval
+}
+
+/// Whether the governor is currently slowing the poller down.
+pub fn is_degraded(q: &QuotaSnapshot, p: Pacing) -> bool {
+    next_interval(q, p) > p.base
 }

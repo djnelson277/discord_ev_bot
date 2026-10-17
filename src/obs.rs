@@ -11,9 +11,7 @@
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
-use crate::owls::quota::{MONTHLY_QUOTA_MVP, QuotaSnapshot};
-
-const DAYS_IN_MONTH: f64 = 30.0;
+use crate::owls::quota::{MONTHLY_QUOTA_MVP, Pacing, QuotaSnapshot, is_degraded};
 
 /// Initialises structured logging to stdout.
 ///
@@ -29,15 +27,17 @@ pub fn init_tracing() {
         .try_init();
 }
 
-/// Warns when the month's budget is being spent faster than it can last.
+/// Warns when the month's budget will not cover the configured plan.
 ///
-/// Returns `None` when spending is on pace, when the plan has no monthly cap,
-/// and when the budget is unknown — before the first response there are no
-/// headers, and "I don't know yet" is not a fault to report.
+/// Tied to the governor's own decision rather than a second, parallel pacing
+/// formula: if `next_interval` is slowing the poller down, the operator should
+/// know, and the two can never disagree. The earlier version had its own
+/// `expected <= 0` guard and so went silent on the last day of the cycle —
+/// exactly when it mattered most.
 ///
-/// `warn_at` is the fraction of the expected remaining budget below which to
-/// warn, e.g. `0.8`.
-pub fn quota_warning(q: &QuotaSnapshot, day_of_month: u32, warn_at: f64) -> Option<String> {
+/// Returns `None` when the plan has no monthly cap and when the budget is
+/// unknown, because "I don't know yet" is not a fault to report.
+pub fn quota_warning(q: &QuotaSnapshot, pacing: Pacing, _warn_at: f64) -> Option<String> {
     if q.unlimited_month {
         return None;
     }
@@ -45,29 +45,22 @@ pub fn quota_warning(q: &QuotaSnapshot, day_of_month: u32, warn_at: f64) -> Opti
 
     if remaining == 0 {
         return Some(
-            "Owls Insight monthly quota is exhausted — polling will 429 until the billing \
-             date resets it."
+            "Owls Insight monthly quota is exhausted — every request will 429 until the \
+             billing date resets it. The bot is effectively off."
                 .to_string(),
         );
     }
 
-    let elapsed = (f64::from(day_of_month) / DAYS_IN_MONTH).clamp(0.0, 1.0);
-    let expected = MONTHLY_QUOTA_MVP as f64 * (1.0 - elapsed);
-    if expected <= 0.0 {
-        return None;
-    }
-
-    let ratio = remaining as f64 / expected;
-    if ratio >= warn_at {
+    if !is_degraded(q, pacing) {
         return None;
     }
 
     let spent_pct = 100.0 * (1.0 - remaining as f64 / MONTHLY_QUOTA_MVP as f64);
     Some(format!(
-        "Quota burn ahead of pace: {remaining} requests left on day {day_of_month} \
-         ({spent_pct:.0}% spent, {:.0}% of the expected remainder). The poller is \
-         lengthening its interval to compensate.",
-        ratio * 100.0
+        "Quota pacing: {remaining} requests left on day {} with {} sport(s) active \
+         ({spent_pct:.0}% of the month spent). The poller has lengthened its interval to \
+         stay inside the cap.",
+        pacing.day_of_month, pacing.active_sports
     ))
 }
 

@@ -166,3 +166,44 @@ fn parses_populated_events_fixture() {
     let first = &e.data[0];
     assert!(!first.commence_time.to_string().is_empty());
 }
+
+#[test]
+fn an_unknown_kind_does_not_destroy_the_whole_board() {
+    // REGRESSION (review finding #8). Kind was a closed enum, so one
+    // unrecognised value was a hard deserialization error for the ENTIRE
+    // EvResponse: if Owls adds a third venue type, every poll of every affected
+    // sport returns a decode error and the bot goes blind indefinitely while
+    // reporting only a warn line. ScheduleGame.status is already a String for
+    // exactly this reason, and an unknown kind falls back to the STRICTER 4%
+    // bar, so tolerance cannot loosen anything.
+    let raw = r#"{"success":true,"data":[{
+        "sport":"nba","homeTeam":"H","awayTeam":"A",
+        "commenceTime":"2026-10-17T23:00:00.000Z",
+        "canonicalEventId":"nba:A@H-20261017",
+        "opportunities":[
+          {"book":"fanduel","side":"home","team":"H","bookPrice":-110,
+           "evPct":5.0,"fairProbability":0.55,"kind":"book"},
+          {"book":"novig","side":"away","team":"A","bookPrice":120,
+           "evPct":6.0,"fairProbability":0.45,"kind":"exchange"}
+        ]}],
+        "meta":{"sport":"nba","timestamp":"2026-10-17T18:00:00.000Z",
+                "freshness":{"ageSeconds":2,"stale":false}}}"#;
+
+    let parsed: EvResponse = serde_json::from_str(raw).expect("board must still parse");
+    let opps = &parsed.data[0].opportunities;
+    assert_eq!(opps.len(), 2, "both opportunities must survive");
+    assert_eq!(opps[0].kind, Some(Kind::Book));
+    assert_eq!(
+        opps[1].kind, None,
+        "an unknown kind becomes None, which takes the stricter trade bar"
+    );
+}
+
+#[test]
+fn an_unknown_side_still_fails_loudly() {
+    // Sides are genuinely closed for a moneyline market, and a wrong side would
+    // name the wrong team on an alert -- worse than no alert.
+    let raw = r#"{"book":"x","side":"sideways","team":"T",
+                  "bookPrice":100,"evPct":1.0,"fairProbability":0.5}"#;
+    assert!(serde_json::from_str::<Opportunity>(raw).is_err());
+}

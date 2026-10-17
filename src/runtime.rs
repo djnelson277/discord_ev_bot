@@ -17,7 +17,7 @@ use crate::discord::publisher::{AlertQueue, DiscordPublisher, build_embed};
 use crate::gating::active_sports;
 use crate::obs::{quota_warning, silence_warning};
 use crate::owls::client::OwlsClient;
-use crate::owls::quota::next_interval;
+use crate::owls::quota::{Pacing, next_interval};
 use crate::poller::{PollContext, poll_once};
 
 /// How long a published alert key stays suppressed. Mirrors the server's
@@ -39,6 +39,22 @@ const QUOTA_WARN_AT: f64 = 0.8;
 /// How often to re-check health. Independent of the poll interval so quota
 /// degradation does not also slow down the reporting of that degradation.
 const HEALTH_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+/// First retry delay after a failed gating pass, doubling each consecutive
+/// failure and capped at the configured refresh interval.
+///
+/// Without a short retry a single transport blip on the first schedule call
+/// left `active` empty for a full hour — and an empty active set also mutes the
+/// silence alarm, so the bot sat completely idle and completely unmonitored.
+/// Starting short matters most at boot, where there is no previous active set
+/// to fall back on and the bot is doing nothing at all until gating succeeds.
+/// Doubling keeps a sustained outage from costing three requests every five
+/// seconds indefinitely.
+const GATING_RETRY_BASE: Duration = Duration::from_secs(5);
+
+/// Consecutive gating failures before telling the operator. One blip is noise;
+/// a run of them means the bot is polling nothing.
+const GATING_FAILURES_BEFORE_ALARM: u32 = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StartupError {
@@ -224,6 +240,7 @@ pub async fn run(
     let mut health_due = Instant::now();
     let started_at = Instant::now();
     let mut last_alert: Option<Instant> = None;
+    let mut gating_failures: u32 = 0;
 
     while !shutdown.is_cancelled() {
         let cfg = cfg_rx.borrow().clone();
@@ -233,15 +250,53 @@ pub async fn run(
                 Ok(active) => {
                     info!(active = ?active, "gating refreshed");
                     ctx.active = active;
+                    gating_failures = 0;
+                    gating_due = Instant::now() + Duration::from_secs(cfg.gating_refresh_secs);
                 }
-                Err(err) => warn!(error = %err, "gating refresh failed; keeping previous set"),
+                Err(err) => {
+                    gating_failures += 1;
+                    warn!(
+                        error = %err,
+                        consecutive = gating_failures,
+                        "gating refresh failed; retrying sooner than the full interval"
+                    );
+                    // Retry soon, not in an hour. Keeping the previous set is
+                    // useless at boot, where it is empty -- the bot would poll
+                    // nothing, and the silence alarm is muted by an empty
+                    // active set, so nothing would report it.
+                    let backoff = GATING_RETRY_BASE
+                        .saturating_mul(1u32 << gating_failures.saturating_sub(1).min(10))
+                        .min(Duration::from_secs(cfg.gating_refresh_secs));
+                    gating_due = Instant::now() + backoff;
+
+                    if gating_failures == GATING_FAILURES_BEFORE_ALARM {
+                        let msg = format!(
+                            "Gating has failed {gating_failures} times in a row ({err}). \
+                             Active sports: {}. While this persists the poller has nothing \
+                             to poll.",
+                            if ctx.active.is_empty() {
+                                "none".to_string()
+                            } else {
+                                ctx.active.iter().cloned().collect::<Vec<_>>().join(", ")
+                            }
+                        );
+                        warn!(warning = %msg, "health");
+                        if let Err(e) = ops_publisher.post_embed(&ops_embed(&msg)).await {
+                            error!(error = %e, "failed to publish gating alarm");
+                        }
+                    }
+                }
             }
-            gating_due = Instant::now() + Duration::from_secs(cfg.gating_refresh_secs);
         }
 
-        let before = queue.len();
         let outcome = poll_once(&mut ctx, &cfg, Instant::now()).await;
-        if queue.len() > before {
+        // Read the outcome, never the queue length. The publisher is a
+        // concurrent consumer that pops as soon as anything is queued, and
+        // poll_once awaits a network round-trip per sport -- so an alert pushed
+        // while polling sport 1 of 10 is normally already sent by the time
+        // poll_once returns, leaving the length unchanged. Comparing lengths
+        // left last_alert at None forever and re-created the cry-wolf bug.
+        if outcome.published > 0 {
             last_alert = Some(Instant::now());
         }
         info!(
@@ -256,11 +311,17 @@ pub async fn run(
 
         let quota = ctx.client.quota();
         let day = Utc::now().day();
-        let interval = next_interval(Duration::from_secs(cfg.poll_interval_secs), &quota, day);
+        let pacing = Pacing {
+            base: Duration::from_secs(cfg.poll_interval_secs),
+            day_of_month: day,
+            active_sports: ctx.active.len(),
+            has_venue_sports: ctx.active.iter().any(|s| ctx.venue_sports.contains(s)),
+        };
+        let interval = next_interval(&quota, pacing);
 
         if Instant::now() >= health_due {
             for warning in [
-                quota_warning(&quota, day, QUOTA_WARN_AT),
+                quota_warning(&quota, pacing, QUOTA_WARN_AT),
                 silence_warning(
                     last_alert,
                     started_at,

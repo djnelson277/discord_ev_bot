@@ -39,8 +39,14 @@ const ABSENCES_TO_REARM: u32 = 2;
 /// `event_id` is `EvEvent::dedupe_key()` — the canonical `sport:away@home-date`
 /// key where available, so the same game dedupes across books. `book` covers
 /// exchanges and prediction markets too; the API field is `book` for all of them.
+///
+/// `sport` is carried even though `event_id` usually embeds it, because ageing
+/// must be scoped to the sport actually polled. Without an explicit field the
+/// suppressor cannot tell which keys a given poll's absence applies to, which
+/// is how the cross-sport ageing bug happened.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AlertKey {
+    pub sport: String,
     pub event_id: String,
     pub book: String,
     pub side: Side,
@@ -149,13 +155,27 @@ impl Suppressor {
         ev >= target - tolerance
     }
 
-    /// Age every tracked key against the set observed this poll, dropping those
-    /// absent for [`ABSENCES_TO_REARM`] consecutive polls.
+    /// Age the keys **of one sport** against what that sport's board showed,
+    /// dropping those absent for [`ABSENCES_TO_REARM`] consecutive polls.
+    ///
+    /// Scoped to `sport` deliberately. The caller polls sports one at a time, so
+    /// an unscoped version ages every other sport's keys once per sport polled:
+    /// with three or more active sports every key reaches the re-arm threshold
+    /// inside a single cycle and is evicted before its own next observation,
+    /// which makes it publish again. That collapses suppression completely at
+    /// any realistic configuration.
     ///
     /// Dropping is what re-arms a key: a price that went away and came back is a
-    /// new crossing and should alert again. It is also what bounds the map.
-    pub fn mark_absent(&mut self, seen_this_poll: &std::collections::HashSet<AlertKey>) {
+    /// new crossing and should alert again.
+    pub fn mark_absent_in_sport(
+        &mut self,
+        sport: &str,
+        seen_this_poll: &std::collections::HashSet<AlertKey>,
+    ) {
         self.seen.retain(|key, state| {
+            if key.sport != sport {
+                return true; // another sport's key; this poll says nothing about it
+            }
             if seen_this_poll.contains(key) {
                 state.absent_polls = 0;
                 true
@@ -165,6 +185,16 @@ impl Suppressor {
             }
         });
     }
+
+    /// Drops every key whose sport is not in `active`.
+    ///
+    /// Scoped ageing means a sport that leaves the gating set stops being aged
+    /// at all, so its keys would be retained forever — a slow leak across a
+    /// season. Dropping them also makes a returning sport re-seed rather than
+    /// republish its whole board, which is the conservative direction.
+    pub fn retain_sports(&mut self, active: &std::collections::BTreeSet<String>) {
+        self.seen.retain(|key, _| active.contains(&key.sport));
+    }
 }
 
 #[cfg(test)]
@@ -173,6 +203,7 @@ mod tests {
 
     fn k() -> AlertKey {
         AlertKey {
+            sport: "nba".into(),
             event_id: "e".into(),
             book: "b".into(),
             side: Side::Home,

@@ -16,6 +16,7 @@ fn t0() -> Instant {
 
 fn key() -> AlertKey {
     AlertKey {
+        sport: "nba".into(),
         event_id: "nba:Lakers@Celtics-20261017".into(),
         book: "fanduel".into(),
         side: Side::Home,
@@ -24,6 +25,7 @@ fn key() -> AlertKey {
 
 fn other_key() -> AlertKey {
     AlertKey {
+        sport: "nba".into(),
         event_id: "nba:Lakers@Celtics-20261017".into(),
         book: "draftkings".into(), // same game, different book
         side: Side::Home,
@@ -142,8 +144,8 @@ fn rearms_after_two_consecutive_absences() {
     let mut s = sup();
     let start = t0();
     s.observe(&key(), 4.0, start);
-    s.mark_absent(&HashSet::new());
-    s.mark_absent(&HashSet::new());
+    s.mark_absent_in_sport("nba", &HashSet::new());
+    s.mark_absent_in_sport("nba", &HashSet::new());
     assert_eq!(
         s.observe(&key(), 4.0, start + Duration::from_secs(300)),
         Decision::Publish
@@ -156,7 +158,7 @@ fn a_single_absence_does_not_rearm() {
     let mut s = sup();
     let start = t0();
     s.observe(&key(), 4.0, start);
-    s.mark_absent(&HashSet::new());
+    s.mark_absent_in_sport("nba", &HashSet::new());
     assert_eq!(
         s.observe(&key(), 4.0, start + Duration::from_secs(120)),
         Decision::Suppress
@@ -172,9 +174,9 @@ fn being_seen_resets_the_absence_counter() {
     let mut seen = HashSet::new();
     seen.insert(key());
 
-    s.mark_absent(&HashSet::new()); // absent once
-    s.mark_absent(&seen); // seen again -> counter resets
-    s.mark_absent(&HashSet::new()); // absent once more, not twice in a row
+    s.mark_absent_in_sport("nba", &HashSet::new()); // absent once
+    s.mark_absent_in_sport("nba", &seen); // seen again -> counter resets
+    s.mark_absent_in_sport("nba", &HashSet::new()); // absent once more, not twice in a row
     assert_eq!(
         s.observe(&key(), 4.0, start + Duration::from_secs(300)),
         Decision::Suppress
@@ -227,11 +229,70 @@ fn tracked_key_count_is_observable() {
     s.observe(&other_key(), 4.0, start);
     assert_eq!(s.tracked(), 2);
 
-    s.mark_absent(&HashSet::new());
-    s.mark_absent(&HashSet::new());
+    s.mark_absent_in_sport("nba", &HashSet::new());
+    s.mark_absent_in_sport("nba", &HashSet::new());
     assert_eq!(
         s.tracked(),
         0,
         "re-armed keys must be dropped, not retained"
+    );
+}
+
+#[test]
+fn mark_absent_must_not_age_keys_belonging_to_other_sports() {
+    // REGRESSION (review finding #1). poll_once calls mark_absent once per
+    // sport, passing only that sport's observed keys. Because the key map is
+    // global, every OTHER sport's keys get aged once per sport polled -- so at
+    // three or more active sports every key reaches ABSENCES_TO_REARM within a
+    // single cycle and is evicted before its own next observation. An evicted
+    // key is unknown at observe() and publishes, collapsing suppression
+    // entirely at the default 10-sport config.
+    let mut s = sup();
+    let start = t0();
+
+    let a = AlertKey {
+        sport: "sportA".into(),
+        event_id: "sportA:g".into(),
+        book: "fanduel".into(),
+        side: Side::Home,
+    };
+    let b = AlertKey {
+        sport: "sportB".into(),
+        event_id: "sportB:g".into(),
+        book: "fanduel".into(),
+        side: Side::Home,
+    };
+    let c = AlertKey {
+        sport: "sportC".into(),
+        event_id: "sportC:g".into(),
+        book: "fanduel".into(),
+        side: Side::Home,
+    };
+
+    // Cycle 1: seed all three, as the first poll of each sport would.
+    for k in [&a, &b, &c] {
+        s.seed(k, 5.0, start);
+    }
+    assert_eq!(s.tracked(), 3);
+
+    // Cycle 2: three sports, each observed then followed by its own
+    // mark_absent -- exactly what poll_once does today.
+    let t = start + Duration::from_secs(60);
+    let mut published = 0;
+    for k in [&a, &b, &c] {
+        if s.observe(k, 5.0, t) == Decision::Publish {
+            published += 1;
+        }
+        s.mark_absent_in_sport(&k.sport, &HashSet::from([k.clone()]));
+    }
+
+    assert_eq!(
+        published, 0,
+        "an unchanged price must stay suppressed; aging is leaking across sports"
+    );
+    assert_eq!(
+        s.tracked(),
+        3,
+        "no key may be evicted while its own sport was observed this cycle"
     );
 }

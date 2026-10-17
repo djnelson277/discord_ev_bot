@@ -75,3 +75,54 @@ fn accepts_absent_consensus_minimum() {
     let cfg = Config::load(Path::new("config/default.toml")).unwrap();
     assert_eq!(cfg.min_books_in_consensus, None);
 }
+
+#[test]
+fn rejects_a_zero_poll_interval() {
+    // REGRESSION (review finding #4). poll_interval_secs = 0 passed validation
+    // and made the main loop a tight request loop: 270 EV requests in 500ms
+    // against a mock, i.e. instant per-minute rate limiting and the whole
+    // monthly quota inside a day. The hot-reload path accepted it live too, so
+    // a mid-slate typo could take the account out.
+    let _g = guard();
+    let err = Config::from_toml_str("poll_interval_secs = 0\n").unwrap_err();
+    assert!(err.to_string().contains("poll_interval_secs"), "got: {err}");
+}
+
+#[test]
+fn rejects_a_poll_interval_below_the_floor() {
+    let _g = guard();
+    assert!(Config::from_toml_str("poll_interval_secs = 1\n").is_err());
+    assert!(Config::from_toml_str("poll_interval_secs = 5\n").is_ok());
+}
+
+#[test]
+fn rejects_an_absurd_gating_refresh() {
+    let _g = guard();
+    assert!(Config::from_toml_str("gating_refresh_secs = 0\n").is_err());
+}
+
+#[test]
+fn rejects_an_empty_sports_or_books_list() {
+    // Both are #[serde(default)], so a mistyped key name yields an empty list:
+    // a bot that polls nothing, or rejects everything, silently. An empty
+    // active set also mutes the silence alarm, so nothing would report it.
+    let _g = guard();
+    assert!(Config::from_toml_str("sports = []\n").is_err());
+    assert!(Config::from_toml_str("books = []\n").is_err());
+}
+
+#[test]
+fn rejects_a_threshold_above_the_server_ceiling() {
+    // The API drops anything over 25% as a data error, so a threshold above it
+    // can never match and would silence the bot completely.
+    let _g = guard();
+    assert!(Config::from_toml_str("min_ev_pct = 30.0\n").is_err());
+    assert!(Config::from_toml_str("min_ev_pct = -1.0\n").is_err());
+}
+
+#[test]
+fn rejects_an_out_of_range_lookahead() {
+    let _g = guard();
+    assert!(Config::from_toml_str("lookahead_hours = 0\n").is_err());
+    assert!(Config::from_toml_str("lookahead_hours = 10000\n").is_err());
+}

@@ -21,8 +21,8 @@ fn write_config(dir: &TempDir, owls: &str, discord: &str, min_ev: f64) -> std::p
 owls_base_url = "{owls}"
 discord_base_url = "{discord}"
 min_ev_pct = {min_ev}
-poll_interval_secs = 1
-gating_refresh_secs = 1
+poll_interval_secs = 5
+gating_refresh_secs = 60
 lookahead_hours = 48
 sports = ["nba"]
 books = ["fanduel"]
@@ -191,4 +191,54 @@ fn secrets_load_when_every_variable_is_present() {
     .unwrap();
     assert_eq!(s.alert_channel, 111);
     assert_eq!(s.ops_channel, 222);
+}
+
+#[tokio::test]
+async fn a_failed_gating_pass_retries_soon_not_in_an_hour() {
+    // REGRESSION (review finding #5). On a gating failure the next attempt was
+    // pushed out by gating_refresh_secs (3600 default) while ctx.active kept
+    // its previous value -- which at boot is EMPTY. So one 429/5xx/transport
+    // blip on the first schedule call left the bot polling nothing for an hour,
+    // and because silence_warning returns None whenever active is empty,
+    // nothing reported it. With a bad API key it was permanent.
+    let owls = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/schedule"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&owls)
+        .await;
+    for s in ["ncaab", "mma"] {
+        Mock::given(path(format!("/api/v1/{s}/events")))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&owls)
+            .await;
+    }
+
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"id":"1"}"#))
+        .mount(&discord)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = write_config(&dir, &owls.uri(), &discord.uri(), 3.5);
+
+    let token = CancellationToken::new();
+    let handle = tokio::spawn(run(cfg_path, secrets(), token.clone()));
+    // Long enough to pass the first 5s retry, short enough to stay a unit test.
+    tokio::time::sleep(Duration::from_millis(7_500)).await;
+    token.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
+
+    let attempts = owls
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/api/v1/schedule")
+        .count();
+    assert!(
+        attempts >= 2,
+        "a failed gating pass must retry on a short backoff, saw {attempts} attempt(s)"
+    );
 }
