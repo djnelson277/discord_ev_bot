@@ -47,6 +47,11 @@ pub struct Config {
     #[serde(default = "default_base_url")]
     pub owls_base_url: String,
 
+    /// Overridable so tests can point at a mock server. Production never
+    /// changes it.
+    #[serde(default = "default_discord_base_url")]
+    pub discord_base_url: String,
+
     /// Alert only on EV strictly greater than this, in percent.
     #[serde(default = "default_min_ev_pct")]
     pub min_ev_pct: f64,
@@ -75,6 +80,9 @@ pub struct Config {
 
 fn default_base_url() -> String {
     "https://api.owlsinsight.com".to_string()
+}
+fn default_discord_base_url() -> String {
+    "https://discord.com".to_string()
 }
 fn default_min_ev_pct() -> f64 {
     3.5
