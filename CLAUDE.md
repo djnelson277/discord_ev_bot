@@ -4,14 +4,76 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-**Pre-implementation.** The approved design is at
-[docs/superpowers/specs/2026-10-16-discord-ev-bot-design.md](docs/superpowers/specs/2026-10-16-discord-ev-bot-design.md).
-Read it before proposing any code — it records decisions and the reasoning
-behind them, including several that are counterintuitive.
+**Phase 1 complete** on branch `feat/phase1-poller` (poller-only; no webhook
+receiver). Design and plan:
 
-No Cargo project exists yet. This file documents the external API's hard
-constraints so they are not re-derived (or guessed wrong) each session. Update
-the Commands section once `Cargo.toml` exists.
+- [docs/superpowers/specs/2026-10-16-discord-ev-bot-design.md](docs/superpowers/specs/2026-10-16-discord-ev-bot-design.md)
+- [docs/superpowers/plans/2026-10-16-phase1-poller.md](docs/superpowers/plans/2026-10-16-phase1-poller.md)
+
+Read the design before proposing changes — it records decisions and the
+reasoning behind them, several of which are counterintuitive. Phase 2 (webhook
+receiver, HMAC verification, hosting) is scoped in the design's §10.
+
+## Commands
+
+```sh
+cargo test                       # whole suite
+cargo test --test dedupe_test    # one suite
+cargo test -- --nocapture        # with println output
+cargo clippy --all-targets
+cargo fmt
+
+# run it (needs .env loaded; EVBOT_CONFIG overrides the config path)
+set -a; . ./.env; set +a
+cargo run
+
+# post embed format previews to the OPS channel (never the alert channel)
+cargo run --example preview_alert
+```
+
+Secrets come from `.env` (gitignored). `.env.example` lists what is required.
+
+## Architecture
+
+Three cooperating loops in [src/runtime.rs](src/runtime.rs), driven by
+[src/main.rs](src/main.rs):
+
+```
+gating (hourly) ──> active sport set
+                         │
+poll loop (60s) ─────────┴─> client ─> filter ─> suppressor ─> queue
+                                                                 │
+publisher ───────────────────────────────────────────────────────┘
+```
+
+| Module | Responsibility |
+|---|---|
+| [src/config.rs](src/config.rs) | Operator criteria; TOML + `EVBOT_` env overrides, validated |
+| [src/owls/models.rs](src/owls/models.rs) | API response types; **casing varies per struct** |
+| [src/owls/client.rs](src/owls/client.rs) | Auth, quota header capture, error taxonomy |
+| [src/owls/quota.rs](src/owls/quota.rs) | `next_interval` burn-rate governor |
+| [src/gating.rs](src/gating.rs) | Which sports are worth polling (3 calls) |
+| [src/filter.rs](src/filter.rs) | Threshold, allowlist, trade bar, consensus |
+| [src/dedupe.rs](src/dedupe.rs) | **Anti-spam core.** Mirrors the server's rule |
+| [src/poller.rs](src/poller.rs) | Per-cycle orchestration, cold-start seeding |
+| [src/discord/publisher.rs](src/discord/publisher.rs) | Embeds, newest-wins queue, 429 handling |
+| [src/obs.rs](src/obs.rs) | Quota and slate-aware silence warnings |
+
+Three things here are load-bearing and easy to break:
+
+- **`dedupe.rs` mirrors the server's suppression rule** because REST `/ev` has
+  none of its own. Its `+1 point` comparison needs the epsilon margin; a bare
+  `>=` silently swallows real alerts.
+- **Cold-start seeding** means a restart publishes nothing until the next
+  genuine crossing. That is deliberate, not a bug.
+- **`silence_warning` measures from process start** when nothing has been
+  published. Treating `None` as "maximally quiet" made the bot false-alarm on
+  every startup — found by running it, not by a test.
+
+Tests use captured live responses in `tests/fixtures/`, not hand-written JSON.
+That is how the casing inconsistency, the non-integer `bookPrice`, and the
+nullable `canonicalEventId` were all caught. Prefer re-capturing a fixture over
+inventing one.
 
 ## What this is
 
