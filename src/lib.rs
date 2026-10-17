@@ -10,3 +10,5 @@ pub mod owls;
 pub mod gating;
 
 pub mod filter;
+
+pub mod dedupe;
