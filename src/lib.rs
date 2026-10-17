@@ -8,3 +8,5 @@ pub mod config;
 pub mod owls;
 
 pub mod gating;
+
+pub mod filter;
