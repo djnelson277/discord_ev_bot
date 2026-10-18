@@ -463,11 +463,14 @@ Non-negotiable, because a silent bot is an actively harmful bot:
 anti-goals require the alert channel stay signal-only, and health noise there
 would train the operator to skim exactly the channel that must be read.
 
-- Track time since last webhook delivery. Alert if it exceeds a threshold
-  during an active slate. **Silence must be judged against the slate model**,
-  not a bare timer: §6.2 establishes that a sport with no upcoming games is
-  worth zero requests, so long legitimate silences are normal and a naive timer
-  will cry wolf. Only warn when the slate says games are live and pre-start.
+- **A heartbeat, not a silence timer.** Post periodically to the ops channel
+  with what the poller saw: sports watched, alerts sent, and the strongest EV
+  observed *including prices that were filtered out*, against the operator's
+  threshold. Absence of a heartbeat is the alarm; its content explains the
+  quiet. A timer-based silence alarm was built first and removed: it could only
+  report "either nothing cleared the threshold or the poller has stopped", which
+  are the two states the operator most needs told apart — and §11 shows silence
+  is the common case, so it would have fired constantly.
 - Surface `meta.freshness.stale` and `board_age_ms` — the API tells us when its
   own data is stale.
 - Poll `GET /api/v1/webhooks/{id}` for `status`, `consecutive_failures`, and
@@ -681,6 +684,48 @@ deletes the tunnel entirely. The tunnel exists only to satisfy the local-first
 requirement. When the move happens, the change is: point `PUBLIC_URL` at the new
 host, `PATCH` the webhook `url`, done — provided the portability rules above
 were followed.
+
+---
+
+## 11. Observed reality: how often do edges actually appear?
+
+Measured 2026-10-18, mid-afternoon on an NFL Sunday, against the live API.
+
+**All ten configured sports returned zero opportunities at `min_ev=0`** — that
+is, not one positive-EV price anywhere, on the busiest day of the US betting
+week, with the board fresh (`ageSeconds: 1`, `venueQuotes: true`).
+
+Hand-computing from Pinnacle's raw prices, Cardinals @ Rams at 43 minutes out:
+
+| | Cardinals | Rams |
+|---|---|---|
+| Pinnacle | +599 | −800 |
+| De-vigged fair | 13.86% | 86.14% |
+| Conservative fair (−1pt) | 12.86% | 85.14% |
+| **Break-even price** | **+677** | **−573** |
+| Best of 12 books | +700 (Novig) | −700 (DraftKings) |
+
+Best EV available anywhere: **+2.91%**, and the API itself reported nothing —
+consistent with the documented rule that a side is **blocked** when a book
+disagrees with Pinnacle by more than 1.5 points. Novig's +700 implies 12.5%
+against Pinnacle's 14.3%, a 1.8-point disagreement, so that price is treated as
+suspect rather than as value.
+
+On Chargers @ Chiefs an hour out, the best across twelve books was **−1.37%**.
+
+### What this means for the design
+
+1. **Alerts will be rare.** Measured in per-day, plausibly fewer. The 1-point
+   conservative margin requires a book to beat Pinnacle's de-vigged line by more
+   than a full point of implied probability, which an efficient market rarely
+   offers.
+2. **Therefore silence is the normal state**, not a symptom. This is what
+   motivated §6.7's heartbeat: the bot must be able to distinguish "watching,
+   market is tight" from "crashed", and a timer-based silence alarm cannot.
+3. **Latency is probably not the bottleneck.** Edges appear to be rare rather
+   than fleeting, which weakens the case for phase 2's push-latency upgrade
+   relative to simply running reliably. Worth re-measuring before committing to
+   hosting spend.
 
 ---
 

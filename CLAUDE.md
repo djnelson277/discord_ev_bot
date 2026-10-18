@@ -57,7 +57,7 @@ publisher ───────────────────────�
 | [src/dedupe.rs](src/dedupe.rs) | **Anti-spam core.** Mirrors the server's rule |
 | [src/poller.rs](src/poller.rs) | Per-cycle orchestration, cold-start seeding |
 | [src/discord/publisher.rs](src/discord/publisher.rs) | Embeds, newest-wins queue, 429 handling |
-| [src/obs.rs](src/obs.rs) | Quota and slate-aware silence warnings |
+| [src/obs.rs](src/obs.rs) | Ops heartbeat and quota burn warnings |
 
 Three things here are load-bearing and easy to break:
 
@@ -66,9 +66,14 @@ Three things here are load-bearing and easy to break:
   `>=` silently swallows real alerts.
 - **Cold-start seeding** means a restart publishes nothing until the next
   genuine crossing. That is deliberate, not a bug.
-- **`silence_warning` measures from process start** when nothing has been
-  published. Treating `None` as "maximally quiet" made the bot false-alarm on
-  every startup — found by running it, not by a test.
+- **Silence is the normal state, and the heartbeat is how the bot says so.**
+  A live NFL Sunday check found the best price across twelve books at +2.91% EV
+  against a 3.5% threshold, and on another game not one positive-EV price
+  existed. `PollOutcome.best_ev` records the strongest EV seen *including
+  filtered-out prices* precisely so the heartbeat can report the near-miss.
+  Absence of a heartbeat is the alarm. Do not reintroduce a timer-based silence
+  warning: it cannot distinguish "market is tight" from "poller is dead", which
+  is the only question that matters.
 
 Tests use captured live responses in `tests/fixtures/`, not hand-written JSON.
 That is how the casing inconsistency, the non-integer `bookPrice`, and the
