@@ -15,7 +15,7 @@ use crate::config::{Config, ConfigError};
 use crate::dedupe::Suppressor;
 use crate::discord::publisher::{AlertQueue, DiscordPublisher, build_embed};
 use crate::gating::active_sports;
-use crate::obs::{quota_warning, silence_warning};
+use crate::obs::{heartbeat_message, quota_warning};
 use crate::owls::client::OwlsClient;
 use crate::owls::quota::{Pacing, next_interval};
 use crate::poller::{PollContext, poll_once};
@@ -29,9 +29,6 @@ const SUPPRESSION_RISE_PP: f64 = 1.0;
 
 /// Alerts buffered before the oldest are dropped.
 const ALERT_QUEUE_CAPACITY: usize = 256;
-
-/// How long alerts may be absent during a live slate before warning.
-const SILENCE_THRESHOLD: Duration = Duration::from_secs(90 * 60);
 
 /// Fraction of the expected remaining monthly budget below which to warn.
 const QUOTA_WARN_AT: f64 = 0.8;
@@ -238,9 +235,10 @@ pub async fn run(
 
     let mut gating_due = Instant::now();
     let mut health_due = Instant::now();
-    let started_at = Instant::now();
-    let mut last_alert: Option<Instant> = None;
     let mut gating_failures: u32 = 0;
+    let mut heartbeat_due = Instant::now() + Duration::from_secs(initial.heartbeat_secs);
+    let mut alerts_since_heartbeat: usize = 0;
+    let mut best_since_heartbeat: Option<crate::poller::BestEv> = None;
 
     while !shutdown.is_cancelled() {
         let cfg = cfg_rx.borrow().clone();
@@ -292,12 +290,17 @@ pub async fn run(
         let outcome = poll_once(&mut ctx, &cfg, Instant::now()).await;
         // Read the outcome, never the queue length. The publisher is a
         // concurrent consumer that pops as soon as anything is queued, and
-        // poll_once awaits a network round-trip per sport -- so an alert pushed
+        // poll_once awaits a network round-trip per sport, so an alert pushed
         // while polling sport 1 of 10 is normally already sent by the time
-        // poll_once returns, leaving the length unchanged. Comparing lengths
-        // left last_alert at None forever and re-created the cry-wolf bug.
-        if outcome.published > 0 {
-            last_alert = Some(Instant::now());
+        // poll_once returns and the length is unchanged.
+        alerts_since_heartbeat += outcome.published;
+        if let Some(best) = &outcome.best_ev {
+            if best_since_heartbeat
+                .as_ref()
+                .is_none_or(|b| best.ev_pct > b.ev_pct)
+            {
+                best_since_heartbeat = Some(best.clone());
+            }
         }
         info!(
             polled = outcome.polled,
@@ -319,19 +322,30 @@ pub async fn run(
         };
         let interval = next_interval(&quota, pacing);
 
+        // The heartbeat is the liveness signal, and its content explains the
+        // quiet. It replaces the old silence warning, which could only say
+        // "either nothing cleared the threshold or the poller has stopped" --
+        // the two states the operator most needs told apart.
+        if Instant::now() >= heartbeat_due {
+            let msg = heartbeat_message(
+                &ctx.active,
+                best_since_heartbeat.take(),
+                cfg.min_ev_pct,
+                alerts_since_heartbeat,
+                &quota,
+            );
+            info!(heartbeat = %msg, "heartbeat");
+            if let Err(err) = ops_publisher.post_embed(&heartbeat_embed(&msg)).await {
+                error!(error = %err, "failed to publish heartbeat");
+            }
+            alerts_since_heartbeat = 0;
+            heartbeat_due = Instant::now() + Duration::from_secs(cfg.heartbeat_secs);
+        }
+
         if Instant::now() >= health_due {
-            for warning in [
-                quota_warning(&quota, pacing, QUOTA_WARN_AT),
-                silence_warning(
-                    last_alert,
-                    started_at,
-                    &ctx.active,
-                    SILENCE_THRESHOLD,
-                    Instant::now(),
-                ),
-            ]
-            .into_iter()
-            .flatten()
+            for warning in [quota_warning(&quota, pacing, QUOTA_WARN_AT)]
+                .into_iter()
+                .flatten()
             {
                 warn!(warning = %warning, "health");
                 let embed = ops_embed(&warning);
@@ -353,6 +367,21 @@ pub async fn run(
     info!("shutdown requested; draining publisher");
     let _ = publisher_task.await;
     Ok(())
+}
+
+/// A calm, visually distinct heartbeat so it never reads as an alarm.
+fn heartbeat_embed(message: &str) -> crate::discord::publisher::Embed {
+    use crate::discord::publisher::{Embed, EmbedFooter};
+    Embed {
+        title: "Heartbeat".to_string(),
+        description: Some(message.to_string()),
+        color: 0x95A5A6, // grey: informational, not a warning
+        url: None,
+        fields: Vec::new(),
+        footer: EmbedFooter {
+            text: "discord_ev_bot".to_string(),
+        },
+    }
 }
 
 fn ops_embed(message: &str) -> crate::discord::publisher::Embed {

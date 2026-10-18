@@ -543,3 +543,82 @@ async fn a_rate_limit_is_waited_out_rather_than_ignored() {
         "the pass must actually wait, took {elapsed:?}"
     );
 }
+
+#[tokio::test]
+async fn tracks_the_best_ev_seen_even_when_nothing_qualifies() {
+    // Today's live check: the best EV across twelve books on an NFL Sunday was
+    // +2.91%, under the operator's 3.5% threshold -- so the bot correctly said
+    // nothing. Without recording the near-miss there is no way to tell "I am
+    // watching and the market is tight" from "I am broken".
+    let server = MockServer::start().await;
+    let board = r#"{"success":true,"data":[{
+        "sport":"nfl","homeTeam":"Los Angeles Rams","awayTeam":"Arizona Cardinals",
+        "commenceTime":"2026-10-18T20:05:00.000Z",
+        "canonicalEventId":"nfl:Arizona Cardinals@Los Angeles Rams-20261018",
+        "opportunities":[
+          {"book":"fanduel","side":"home","team":"Los Angeles Rams","bookPrice":-800,
+           "evPct":1.2,"fairProbability":0.85,"kind":"book","tradeable":false},
+          {"book":"draftkings","side":"away","team":"Arizona Cardinals","bookPrice":500,
+           "evPct":2.91,"fairProbability":0.13,"kind":"book","tradeable":false}
+        ]}],
+        "meta":{"sport":"nfl","timestamp":"2026-10-18T19:20:00.000Z",
+                "freshness":{"ageSeconds":1,"stale":false}}}"#;
+    mount_ev(&server, "nfl", board.to_string()).await;
+
+    let mut c = ctx(&server, &["nfl"]);
+    let mut conf = cfg(&server.uri());
+    conf.sports = vec!["nfl".into()];
+    c.seeded.insert("nfl".to_string()); // past the seeding poll
+
+    let out = poll_once(&mut c, &conf, Instant::now()).await;
+
+    assert_eq!(out.published, 0, "nothing clears 3.5%");
+    assert_eq!(out.rejected, 2);
+
+    let best = out.best_ev.expect("the near-miss must be recorded");
+    assert_eq!(best.ev_pct, 2.91);
+    assert_eq!(best.book, "draftkings");
+    assert_eq!(best.sport, "nfl");
+    assert!(best.matchup.contains("Rams"), "got {}", best.matchup);
+}
+
+#[tokio::test]
+async fn best_ev_spans_every_sport_in_the_cycle() {
+    let server = MockServer::start().await;
+    for (sport, ev) in [("nba", 2.0), ("nhl", 3.1), ("soccer", 1.4)] {
+        let board = format!(
+            r#"{{"success":true,"data":[{{
+                "sport":"{sport}","homeTeam":"H","awayTeam":"A",
+                "commenceTime":"2026-10-18T23:00:00.000Z",
+                "canonicalEventId":"{sport}:A@H-20261018",
+                "opportunities":[{{"book":"fanduel","side":"home","team":"H",
+                   "bookPrice":-110,"evPct":{ev},"fairProbability":0.5,
+                   "kind":"book","tradeable":false}}]}}],
+                "meta":{{"sport":"{sport}","timestamp":"2026-10-18T19:20:00.000Z",
+                    "freshness":{{"ageSeconds":1,"stale":false}}}}}}"#
+        );
+        mount_ev(&server, sport, board).await;
+    }
+
+    let mut c = ctx(&server, &["nba", "nhl", "soccer"]);
+    let mut conf = cfg(&server.uri());
+    conf.sports = vec!["nba".into(), "nhl".into(), "soccer".into()];
+    for s in ["nba", "nhl", "soccer"] {
+        c.seeded.insert(s.to_string());
+    }
+
+    let out = poll_once(&mut c, &conf, Instant::now()).await;
+    let best = out.best_ev.expect("should record a best");
+    assert_eq!(best.ev_pct, 3.1);
+    assert_eq!(best.sport, "nhl");
+}
+
+#[tokio::test]
+async fn an_empty_board_records_no_best_ev() {
+    let server = MockServer::start().await;
+    mount_ev(&server, "nba", EMPTY_FRESH_BOARD.to_string()).await;
+    let mut c = ctx(&server, &["nba"]);
+    c.seeded.insert("nba".to_string());
+    let out = poll_once(&mut c, &cfg(&server.uri()), Instant::now()).await;
+    assert!(out.best_ev.is_none());
+}

@@ -9,6 +9,11 @@ min_ev_pct = 3.5
 poll_interval_secs = 60
 gating_refresh_secs = 3600
 
+# How often the ops channel gets a "here is what I saw" report. Silence is this
+# bot's normal state, so the heartbeat is what distinguishes "watching, market
+# is tight" from "crashed". Absence of it is the alarm.
+heartbeat_secs = 1800
+
 # A sport is "active" if it has an unstarted game within this many hours.
 lookahead_hours = 48
 

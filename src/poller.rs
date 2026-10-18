@@ -49,7 +49,21 @@ pub struct PollContext {
     pub venue_sports: HashSet<String>,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+/// The strongest EV seen in a cycle, whether or not it qualified.
+///
+/// Recorded so the bot can explain its own silence. A live check on an NFL
+/// Sunday found the best price across twelve books at +2.91% against a 3.5%
+/// threshold: correct to stay quiet, but indistinguishable from a broken bot
+/// unless the near-miss is reported.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BestEv {
+    pub ev_pct: f64,
+    pub book: String,
+    pub sport: String,
+    pub matchup: String,
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct PollOutcome {
     /// Sports whose board was fetched and usable.
     pub polled: usize,
@@ -63,6 +77,9 @@ pub struct PollOutcome {
     pub errors: usize,
     /// Sports skipped this cycle because the API asked us to back off.
     pub rate_limited: usize,
+    /// Strongest EV observed anywhere this cycle, including prices that were
+    /// filtered out. `None` means not one positive-EV price existed.
+    pub best_ev: Option<BestEv>,
 }
 
 /// One pass over the active sports.
@@ -135,6 +152,18 @@ pub async fn poll_once(ctx: &mut PollContext, cfg: &Config, now_mono: Instant) -
             for opp in &event.opportunities {
                 if matches!(opp.kind, Some(Kind::Venue)) {
                     ctx.venue_sports.insert(sport.clone());
+                }
+
+                // Recorded before filtering, deliberately: a near-miss is the
+                // most informative thing the bot can say when it is quiet.
+                let better = out.best_ev.as_ref().is_none_or(|b| opp.ev_pct > b.ev_pct);
+                if better {
+                    out.best_ev = Some(BestEv {
+                        ev_pct: opp.ev_pct,
+                        book: opp.book.clone(),
+                        sport: sport.clone(),
+                        matchup: format!("{} @ {}", event.away_team, event.home_team),
+                    });
                 }
 
                 match is_publishable(opp, cfg) {

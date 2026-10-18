@@ -9,9 +9,9 @@
 //! operator to skim exactly the channel that has to be read.
 
 use std::collections::BTreeSet;
-use std::time::{Duration, Instant};
 
 use crate::owls::quota::{MONTHLY_QUOTA_MVP, Pacing, QuotaSnapshot, is_degraded};
+use crate::poller::BestEv;
 
 /// Initialises structured logging to stdout.
 ///
@@ -64,66 +64,74 @@ pub fn quota_warning(q: &QuotaSnapshot, pacing: Pacing, _warn_at: f64) -> Option
     ))
 }
 
-/// Warns when no alert has been published for too long **while games are live**.
+// `silence_warning` was removed when the heartbeat replaced it. It could only
+// ever say "either nothing cleared the threshold or the poller has stopped" --
+// precisely the two states an operator needs told apart -- and a live NFL
+// Sunday check showed silence is the normal case, so the ambiguous version
+// would have fired constantly. The heartbeat answers the question instead:
+// absence of it is the alarm, and its content explains the quiet.
+
+/// A periodic "here is what I saw" report for the ops channel.
 ///
-/// `active` is the gating pass's active-sport set. When it is empty the silence
-/// is expected, not a fault: the poller deliberately spends zero requests on a
-/// sport with no upcoming games, so quiet nights are normal and a bare timer
-/// would cry wolf nightly. An ops channel that cries wolf is one nobody reads
-/// when it matters.
+/// This exists because silence is the bot's normal state and was previously
+/// ambiguous. A live check during an NFL Sunday slate found the best price
+/// across twelve books at +2.91% against a 3.5% threshold, and on another game
+/// not one positive-EV price existed at all — both correct reasons to stay
+/// quiet, and both indistinguishable from a crash.
 ///
-/// `last_alert` of `None` means nothing has been published since boot, in which
-/// case silence is measured from `started_at`. That distinction is not academic:
-/// treating `None` as "maximally quiet" made the bot post a false "the poller
-/// has stopped" alarm on every single startup, which is precisely the
-/// cry-wolf failure this function exists to avoid. Found by running it.
-pub fn silence_warning(
-    last_alert: Option<Instant>,
-    started_at: Instant,
+/// Absence of a heartbeat is the alarm; its content explains the quiet.
+pub fn heartbeat_message(
     active: &BTreeSet<String>,
-    threshold: Duration,
-    now: Instant,
-) -> Option<String> {
+    best: Option<BestEv>,
+    threshold_pct: f64,
+    alerts_since_last: usize,
+    quota: &QuotaSnapshot,
+) -> String {
+    let mut parts = Vec::new();
+
     if active.is_empty() {
-        return None;
-    }
-
-    // With nothing published yet, the clock runs from process start -- a bot up
-    // for five seconds has not been silent for an hour.
-    let since = last_alert.unwrap_or(started_at);
-    let quiet_for = now.saturating_duration_since(since);
-
-    if quiet_for < threshold {
-        return None;
-    }
-
-    let sports: Vec<&str> = active.iter().map(String::as_str).collect();
-    Some(format!(
-        "No alert published in {}s while {} sport(s) have live pre-game slates ({}). \
-         Either nothing is clearing the threshold, or the poller has stopped.",
-        quiet_for.as_secs(),
-        active.len(),
-        sports.join(", ")
-    ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn an_empty_active_set_silences_the_silence_warning() {
-        let now = Instant::now();
-        assert!(
-            silence_warning(
-                None,
-                now - Duration::from_secs(99_999),
-                &BTreeSet::new(),
-                Duration::from_secs(0),
-                now
-            )
-            .is_none(),
-            "no slate means no fault, even with a zero threshold"
+        parts.push(
+            "No sports in season or pre-game right now, so nothing is being polled.".to_string(),
         );
+    } else {
+        let sports: Vec<&str> = active.iter().map(String::as_str).collect();
+        parts.push(format!(
+            "Watching {} sport(s): {}.",
+            active.len(),
+            sports.join(", ")
+        ));
     }
+
+    parts.push(match alerts_since_last {
+        0 => "No alerts sent since the last report.".to_string(),
+        1 => "1 alert sent since the last report.".to_string(),
+        n => format!("{n} alerts sent since the last report."),
+    });
+
+    parts.push(match best {
+        Some(b) => format!(
+            "Best price seen: {:+.2}% EV at {} on {} ({}). Your threshold is >{:.2}%.",
+            b.ev_pct, b.book, b.matchup, b.sport, threshold_pct
+        ),
+        None if active.is_empty() => String::new(),
+        // Distinct from "nothing cleared the bar": not one book beat the
+        // conservative fair on any game, which is what an efficient market
+        // looks like.
+        None => format!(
+            "No positive-EV price on any game this period — every book was at or \
+             behind the fair. Your threshold is >{threshold_pct:.2}%."
+        ),
+    });
+
+    if quota.unlimited_month {
+        parts.push("Quota: unlimited.".to_string());
+    } else if let Some(r) = quota.remaining_month {
+        let pct = 100.0 * r as f64 / MONTHLY_QUOTA_MVP as f64;
+        parts.push(format!(
+            "Quota: {r} requests left ({pct:.0}% of the month)."
+        ));
+    }
+
+    parts.retain(|p| !p.is_empty());
+    parts.join(" ")
 }

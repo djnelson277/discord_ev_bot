@@ -40,6 +40,10 @@ pub const MIN_POLL_INTERVAL_SECS: u64 = 5;
 /// every second would spend more than the polling it exists to economise.
 pub const MIN_GATING_REFRESH_SECS: u64 = 60;
 
+/// Floor on the heartbeat interval. More often than this is ops-channel noise,
+/// which is the thing that makes an ops channel unread.
+pub const MIN_HEARTBEAT_SECS: u64 = 60;
+
 /// The server drops any EV above this as a data error, so a threshold above it
 /// can never match and would silence the bot entirely.
 pub const MAX_SENSIBLE_MIN_EV_PCT: f64 = 25.0;
@@ -93,6 +97,15 @@ pub struct Config {
     #[serde(default = "default_gating_refresh")]
     pub gating_refresh_secs: u64,
 
+    /// How often to post a heartbeat to the ops channel.
+    ///
+    /// The heartbeat exists because silence is this bot's normal state: a live
+    /// NFL Sunday check found the best price across twelve books at +2.91%
+    /// against a 3.5% threshold. Absence of a heartbeat is the alarm, so this
+    /// should stay short enough that you notice it stopping.
+    #[serde(default = "default_heartbeat_secs")]
+    pub heartbeat_secs: u64,
+
     #[serde(default = "default_lookahead_hours")]
     pub lookahead_hours: i64,
 
@@ -126,6 +139,9 @@ fn default_gating_refresh() -> u64 {
 }
 fn default_lookahead_hours() -> i64 {
     48
+}
+fn default_heartbeat_secs() -> u64 {
+    1800
 }
 fn default_sports() -> Vec<String> {
     [
@@ -181,6 +197,13 @@ impl Config {
                 field: "gating_refresh_secs",
                 min: MIN_GATING_REFRESH_SECS.to_string(),
                 got: self.gating_refresh_secs.to_string(),
+            });
+        }
+        if self.heartbeat_secs < MIN_HEARTBEAT_SECS {
+            return Err(ConfigError::TooSmall {
+                field: "heartbeat_secs",
+                min: MIN_HEARTBEAT_SECS.to_string(),
+                got: self.heartbeat_secs.to_string(),
             });
         }
         if self.lookahead_hours < 1 {

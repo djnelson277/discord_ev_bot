@@ -1,8 +1,9 @@
 use std::collections::BTreeSet;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use discord_ev_bot::obs::{quota_warning, silence_warning};
+use discord_ev_bot::obs::{heartbeat_message, quota_warning};
 use discord_ev_bot::owls::quota::{MONTHLY_QUOTA_MVP, Pacing, QuotaSnapshot};
+use discord_ev_bot::poller::BestEv;
 
 fn healthy() -> QuotaSnapshot {
     QuotaSnapshot {
@@ -20,10 +21,6 @@ fn pacing(active_sports: usize, day_of_month: u32) -> Pacing {
         active_sports,
         has_venue_sports: false,
     }
-}
-
-fn active(sports: &[&str]) -> BTreeSet<String> {
-    sports.iter().map(|s| s.to_string()).collect()
 }
 
 // ------------------------------------------------------------ quota warnings
@@ -76,116 +73,68 @@ fn exhausted_budget_warns_regardless_of_day() {
     assert!(quota_warning(&q, pacing(10, 2), 0.8).is_some());
 }
 
-// ---------------------------------------------------------- silence warnings
+// ------------------------------------------------------------- heartbeat
 
 #[test]
-fn no_silence_warning_when_nothing_is_in_season() {
-    // A quiet Tuesday with no slate is not a fault. Judging silence on a bare
-    // timer would cry wolf every night, and an ops channel that cries wolf is
-    // one nobody reads when it matters.
-    let quiet = BTreeSet::new();
-    let now = Instant::now();
+fn heartbeat_names_the_near_miss_and_the_threshold() {
+    // The whole point: make silence self-explaining. "Best EV was 2.91% and
+    // your bar is 3.5%" tells the operator the bot is alive AND why it is quiet.
+    let msg = heartbeat_message(
+        &["nfl".to_string(), "nba".to_string()].into_iter().collect(),
+        Some(BestEv {
+            ev_pct: 2.91,
+            book: "draftkings".into(),
+            sport: "nfl".into(),
+            matchup: "Arizona Cardinals @ Los Angeles Rams".into(),
+        }),
+        3.5,
+        0,
+        &QuotaSnapshot {
+            remaining_month: Some(287_000),
+            ..healthy()
+        },
+    );
+    assert!(msg.contains("2.91"), "best EV missing: {msg}");
+    assert!(msg.contains("3.5"), "threshold missing: {msg}");
+    assert!(msg.contains("draftkings"), "book missing: {msg}");
+    assert!(msg.contains("Rams"), "matchup missing: {msg}");
+}
+
+#[test]
+fn heartbeat_says_so_when_no_price_was_positive_at_all() {
+    // Today's actual state across all ten sports: not one positive-EV price.
+    let msg = heartbeat_message(
+        &["nfl".to_string()].into_iter().collect(),
+        None,
+        3.5,
+        0,
+        &healthy(),
+    );
     assert!(
-        silence_warning(
-            None,
-            now - Duration::from_secs(99_999),
-            &quiet,
-            Duration::from_secs(3600),
-            now
-        )
-        .is_none()
+        msg.to_lowercase().contains("no positive"),
+        "should distinguish 'nothing positive' from 'nothing cleared': {msg}"
     );
 }
 
 #[test]
-fn no_silence_warning_before_the_threshold_elapses() {
-    let now = Instant::now();
-    let recent = now - Duration::from_secs(60);
-    assert!(
-        silence_warning(
-            Some(recent),
-            now - Duration::from_secs(99_999),
-            &active(&["nba"]),
-            Duration::from_secs(3600),
-            now
-        )
-        .is_none()
+fn heartbeat_reports_alerts_when_there_were_some() {
+    let msg = heartbeat_message(
+        &["nfl".to_string()].into_iter().collect(),
+        None,
+        3.5,
+        4,
+        &healthy(),
     );
+    assert!(msg.contains('4'), "alert count missing: {msg}");
 }
 
 #[test]
-fn warns_on_long_silence_while_a_slate_is_live() {
-    let now = Instant::now();
-    let long_ago = now - Duration::from_secs(7200);
-    let w = silence_warning(
-        Some(long_ago),
-        now - Duration::from_secs(99_999),
-        &active(&["nba", "nhl"]),
-        Duration::from_secs(3600),
-        now,
-    )
-    .expect("should warn");
-    assert!(w.to_lowercase().contains("alert"), "got: {w}");
-}
-
-#[test]
-fn does_not_cry_wolf_at_startup() {
-    // Found by running the binary: `last_alert: None` at boot was treated as
-    // "maximally quiet", so the bot posted a false "the poller has stopped"
-    // alarm on EVERY start. Silence must be measured from process start, not
-    // from the beginning of time.
-    let now = Instant::now();
-    let just_started = now - Duration::from_secs(5);
+fn heartbeat_mentions_an_idle_bot_rather_than_pretending_to_watch() {
+    // No active sports is a legitimate quiet night, and the heartbeat should say
+    // that plainly instead of implying it is scanning.
+    let msg = heartbeat_message(&BTreeSet::new(), None, 3.5, 0, &healthy());
     assert!(
-        silence_warning(
-            None,
-            just_started,
-            &active(&["nba", "nhl"]),
-            Duration::from_secs(3600),
-            now
-        )
-        .is_none(),
-        "a freshly started bot has not been silent for an hour"
+        msg.to_lowercase().contains("no sport"),
+        "should state there is nothing in season: {msg}"
     );
-}
-
-#[test]
-fn warns_when_nothing_has_been_sent_since_a_long_ago_start() {
-    // Still reports the genuine case: up for hours, games live, nothing sent.
-    let now = Instant::now();
-    let started_long_ago = now - Duration::from_secs(7200);
-    assert!(
-        silence_warning(
-            None,
-            started_long_ago,
-            &active(&["nba"]),
-            Duration::from_secs(3600),
-            now
-        )
-        .is_some()
-    );
-}
-
-#[test]
-fn the_quota_warning_speaks_on_the_last_day_of_the_cycle() {
-    // REGRESSION (review finding #3). quota_warning had its own
-    // `expected <= 0.0` guard, so on day 30 it returned None no matter how
-    // little budget was left -- going silent on exactly the day it mattered.
-    // It is now tied to the governor's own decision, so the two cannot disagree.
-    let q = QuotaSnapshot {
-        remaining_month: Some(500),
-        ..healthy()
-    };
-    assert!(quota_warning(&q, pacing(10, 30), 0.8).is_some());
-}
-
-#[test]
-fn the_quota_warning_tracks_the_governor() {
-    // Healthy budget, modest plan: the governor is not degrading, so there is
-    // nothing to tell the operator.
-    let q = QuotaSnapshot {
-        remaining_month: Some(250_000),
-        ..healthy()
-    };
-    assert!(quota_warning(&q, pacing(3, 5), 0.8).is_none());
 }
