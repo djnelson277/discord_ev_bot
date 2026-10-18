@@ -4,7 +4,7 @@
 owls_base_url = "https://api.owlsinsight.com"
 
 # Alert only on EV strictly greater than this, in percent.
-min_ev_pct = 3.5
+min_ev_pct = 2.5
 
 poll_interval_secs = 60
 gating_refresh_secs = 3600

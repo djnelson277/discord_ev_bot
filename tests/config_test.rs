@@ -18,12 +18,47 @@ fn guard() -> std::sync::MutexGuard<'static, ()> {
 }
 
 #[test]
-fn loads_defaults_from_toml() {
+fn the_shipped_config_loads_and_validates() {
+    // Deliberately asserts NOTHING about the operator's tuned values. An
+    // earlier version pinned min_ev_pct == 3.5 against this live file, so the
+    // moment the operator changed their own threshold the suite went red --
+    // which teaches people to ignore test failures. What matters here is that
+    // the file parses and passes validation; the values are the operator's.
     let _g = guard();
-    let cfg = Config::load(Path::new("config/default.toml")).unwrap();
+    let cfg = Config::load(Path::new("config/default.toml")).expect("shipped config must load");
+
+    assert!(!cfg.sports.is_empty(), "sports must be configured");
+    assert!(!cfg.books.is_empty(), "books must be configured");
+    assert!(
+        cfg.min_ev_pct >= 0.0 && cfg.min_ev_pct <= 25.0,
+        "threshold {} is outside the range the server can serve",
+        cfg.min_ev_pct
+    );
+    assert!(cfg.poll_interval_secs >= 5);
+    assert!(!cfg.owls_base_url.is_empty());
+}
+
+#[test]
+fn parses_exact_values_from_a_fixed_document() {
+    // The parser's own contract, pinned against an inline document so it is
+    // independent of whatever the operator has configured today.
+    let _g = guard();
+    let cfg = Config::from_toml_str(
+        r#"
+        min_ev_pct = 3.5
+        poll_interval_secs = 60
+        gating_refresh_secs = 3600
+        heartbeat_secs = 1800
+        lookahead_hours = 48
+        sports = ["nfl","nba","mlb","nhl","ncaaf","ncaab","wnba","soccer","tennis","mma"]
+        books = ["betmgm","fanduel","draftkings","bet365","novig","kalshi","polymarket"]
+        "#,
+    )
+    .unwrap();
     assert_eq!(cfg.min_ev_pct, 3.5);
     assert_eq!(cfg.poll_interval_secs, 60);
     assert_eq!(cfg.gating_refresh_secs, 3600);
+    assert_eq!(cfg.heartbeat_secs, 1800);
     assert_eq!(cfg.sports.len(), 10);
     assert!(cfg.books.contains(&"polymarket".to_string()));
 }
