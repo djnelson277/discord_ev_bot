@@ -247,7 +247,12 @@ pub async fn run(
     let mut gating_due = Instant::now();
     let mut health_due = Instant::now();
     let mut gating_failures: u32 = 0;
-    let mut heartbeat_due = Instant::now() + Duration::from_secs(initial.heartbeat_secs);
+    // Due immediately, so the first poll is followed straight away by a
+    // heartbeat. Scheduling it a full interval out meant a fresh deploy went
+    // quiet for 30 minutes -- precisely when the operator most needs
+    // confirmation, and indistinguishable from the process having died, since
+    // absence of a heartbeat is the alarm.
+    let mut heartbeat_due = Instant::now();
     let mut queued_since_heartbeat: usize = 0;
     let mut delivered_at_last_heartbeat: usize = 0;
     let mut best_since_heartbeat: Option<crate::poller::BestEv> = None;

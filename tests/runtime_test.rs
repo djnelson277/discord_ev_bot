@@ -242,3 +242,41 @@ async fn a_failed_gating_pass_retries_soon_not_in_an_hour() {
         "a failed gating pass must retry on a short backoff, saw {attempts} attempt(s)"
     );
 }
+
+#[tokio::test]
+async fn posts_a_heartbeat_promptly_after_startup() {
+    // The first heartbeat used to be scheduled a full interval out, so a fresh
+    // deploy produced 30 minutes of silence -- exactly when the operator most
+    // needs confirmation, and indistinguishable from the bot having died, since
+    // absence of a heartbeat IS the alarm.
+    let owls = owls_mock().await;
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v10/channels/2/messages")) // the OPS channel
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"id":"1"}"#))
+        .mount(&discord)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    // heartbeat_secs is 1800 in the written config; a prompt first beat must
+    // not wait for it.
+    let cfg_path = write_config(&dir, &owls.uri(), &discord.uri(), 3.5);
+
+    let token = CancellationToken::new();
+    let handle = tokio::spawn(run(cfg_path, secrets(), token.clone()));
+    tokio::time::sleep(Duration::from_millis(3_000)).await;
+    token.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
+
+    let posts = discord
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().contains("/channels/2/messages"))
+        .count();
+    assert!(
+        posts >= 1,
+        "expected a startup heartbeat within seconds, saw {posts}"
+    );
+}
