@@ -1,16 +1,24 @@
 # Railway deployment config.
 #
+# Builds from the Dockerfile rather than Nixpacks. The first attempt used
+# Nixpacks with a hand-written startCommand of "./target/release/discord_ev_bot";
+# that path exists in the BUILD stage but not in the runtime image, so the
+# service crash-looped on "No such file or directory" once a second. A
+# Dockerfile removes the guesswork about where a builder puts things, and it is
+# testable locally with `docker run` before deploying.
+#
+# The start command lives in the Dockerfile's CMD. Do not re-add one here.
+#
 # numReplicas MUST stay 1. Suppression state lives in memory, per process, so a
 # second replica is a second bot with its own empty suppressor: it would publish
 # every opportunity the first one had already alerted on, and burn a second copy
 # of the monthly API quota. Scaling this service horizontally is always wrong.
 
 [build]
-builder = "NIXPACKS"
-buildCommand = "cargo build --release --bin discord_ev_bot"
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "./target/release/discord_ev_bot"
 numReplicas = 1
 # A poller that exits has failed; always bring it back.
 restartPolicyType = "ALWAYS"

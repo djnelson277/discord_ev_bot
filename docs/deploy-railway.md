@@ -26,13 +26,28 @@ feature branch means every work-in-progress commit goes to production.
 2. **New Project → Deploy from GitHub repo →** `djnelson277/discord_ev_bot`.
 3. Pick the branch (see above).
 
-Railway reads [`railway.toml`](../railway.toml) and
-[`rust-toolchain.toml`](../rust-toolchain.toml) from the repo, so the builder,
-Rust version, build command and start command are already set. You should not
-need to configure any of that in the dashboard.
+Railway reads [`railway.toml`](../railway.toml), which points it at the
+[`Dockerfile`](../Dockerfile). The Rust version, build steps and start command
+all live there, so you should not need to configure any of it in the dashboard.
 
 The first build takes several minutes — it compiles ~370 crates from scratch.
-Later builds reuse the cache.
+Dependencies are built in their own layer, so later builds that only touch
+`src/` reuse the cache and finish in seconds.
+
+**Verify changes locally before deploying.** The container is the same artifact
+Railway runs:
+
+```sh
+docker build -t evbot .
+set -a; . ./.env; set +a
+docker run --rm \
+  -e OWLS_API_KEY -e DISCORD_TOKEN \
+  -e DISCORD_ALERT_CHANNEL_ID -e DISCORD_OPS_CHANNEL_ID \
+  evbot
+```
+
+An earlier Nixpacks attempt crash-looped in production on a path that only
+existed at build time. One `docker run` would have caught it.
 
 ## 2. Set the four variables
 

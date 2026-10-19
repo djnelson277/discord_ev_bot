@@ -1,0 +1,7 @@
+target
+.git
+.env
+docs
+tests
+examples
+.superpowers
