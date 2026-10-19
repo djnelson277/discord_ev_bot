@@ -2,36 +2,63 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## What this is
+
+A Rust service that posts a Discord message when a positive expected value
+(+EV) moneyline price appears at one of the operator's books. **EV is computed
+by the Owls Insight API, not here.** This project filters and delivers; it does
+not price.
+
 ## Project status
 
-**Phase 1 complete** on branch `feat/phase1-poller` (poller-only; no webhook
-receiver). Design and plan:
+**Phase 1 (poller-only) is complete, merged to `main`, and deployed on
+Railway.** Phase 2 — webhook receiver, HMAC verification, `/healthz` — is
+scoped in the design's §10 but not built.
 
-- [docs/superpowers/specs/2026-10-16-discord-ev-bot-design.md](docs/superpowers/specs/2026-10-16-discord-ev-bot-design.md)
-- [docs/superpowers/plans/2026-10-16-phase1-poller.md](docs/superpowers/plans/2026-10-16-phase1-poller.md)
+| Document | What it holds |
+|---|---|
+| [design](docs/superpowers/specs/2026-10-16-discord-ev-bot-design.md) | Intent, goals, anti-goals, every API constraint with its source, and §11's live market measurements |
+| [plan](docs/superpowers/plans/2026-10-16-phase1-poller.md) | The phase 1 task breakdown |
+| [follow-ups](docs/superpowers/specs/2026-10-17-phase1-followups.md) | 8 deferred minors from the final review |
+| [deploy runbook](docs/deploy-railway.md) | Railway setup, env vars, what behaves differently there |
 
-Read the design before proposing changes — it records decisions and the
-reasoning behind them, several of which are counterintuitive. Phase 2 (webhook
-receiver, HMAC verification, hosting) is scoped in the design's §10.
+Read the design before proposing changes. It records *why* for decisions that
+look arbitrary, several of which are counterintuitive.
 
 ## Commands
 
 ```sh
-cargo test                       # whole suite
+cargo test                       # whole suite (156 tests)
 cargo test --test dedupe_test    # one suite
-cargo test -- --nocapture        # with println output
 cargo clippy --all-targets
 cargo fmt
 
-# run it (needs .env loaded; EVBOT_CONFIG overrides the config path)
+# run locally (needs .env; EVBOT_CONFIG overrides the config path)
 set -a; . ./.env; set +a
 cargo run
 
-# post embed format previews to the OPS channel (never the alert channel)
+# keep a Mac awake while it runs — lid MUST stay open, caffeinate
+# cannot override lid-close sleep
+caffeinate -dis cargo run
+
+# embed format previews, to the OPS channel only
 cargo run --example preview_alert
 ```
 
-Secrets come from `.env` (gitignored). `.env.example` lists what is required.
+**Verify container changes locally before deploying.** This is the same
+artifact Railway runs:
+
+```sh
+docker build -t evbot .
+set -a; . ./.env; set +a
+docker run --rm -e OWLS_API_KEY -e DISCORD_TOKEN \
+  -e DISCORD_ALERT_CHANNEL_ID -e DISCORD_OPS_CHANNEL_ID evbot
+```
+
+A deploy config that was never executed locally crash-looped in production on a
+path that only existed at build time. One `docker run` would have caught it.
+
+Secrets live in `.env` (gitignored). `.env.example` lists what is required.
 
 ## Architecture
 
@@ -44,134 +71,138 @@ gating (hourly) ──> active sport set
 poll loop (60s) ─────────┴─> client ─> filter ─> suppressor ─> queue
                                                                  │
 publisher ───────────────────────────────────────────────────────┘
+                         │
+heartbeat (30m) ─────────┴─> ops channel
 ```
 
 | Module | Responsibility |
 |---|---|
-| [src/config.rs](src/config.rs) | Operator criteria; TOML + `EVBOT_` env overrides, validated |
-| [src/owls/models.rs](src/owls/models.rs) | API response types; **casing varies per struct** |
-| [src/owls/client.rs](src/owls/client.rs) | Auth, quota header capture, error taxonomy |
-| [src/owls/quota.rs](src/owls/quota.rs) | `next_interval` burn-rate governor |
-| [src/gating.rs](src/gating.rs) | Which sports are worth polling (3 calls) |
-| [src/filter.rs](src/filter.rs) | Threshold, allowlist, trade bar, consensus |
-| [src/dedupe.rs](src/dedupe.rs) | **Anti-spam core.** Mirrors the server's rule |
-| [src/poller.rs](src/poller.rs) | Per-cycle orchestration, cold-start seeding |
-| [src/discord/publisher.rs](src/discord/publisher.rs) | Embeds, newest-wins queue, 429 handling |
-| [src/obs.rs](src/obs.rs) | Ops heartbeat and quota burn warnings |
+| [config.rs](src/config.rs) | Operator criteria; TOML + `EVBOT_` env overrides, validated with bounds |
+| [owls/models.rs](src/owls/models.rs) | API response types; **casing varies per struct** |
+| [owls/client.rs](src/owls/client.rs) | Auth, quota header capture, error taxonomy |
+| [owls/quota.rs](src/owls/quota.rs) | Predictive burn-rate governor (`next_interval`) |
+| [gating.rs](src/gating.rs) | Which sports are worth polling (3 calls) |
+| [filter.rs](src/filter.rs) | Threshold, allowlist, trade bar, consensus |
+| [dedupe.rs](src/dedupe.rs) | **Anti-spam core.** Mirrors the server's rule |
+| [poller.rs](src/poller.rs) | Per-cycle orchestration, cold-start seeding, `best_ev` |
+| [discord/publisher.rs](src/discord/publisher.rs) | Embeds, newest-wins queue, 429 handling |
+| [obs.rs](src/obs.rs) | Ops heartbeat and quota burn warnings |
 
-Three things here are load-bearing and easy to break:
+---
 
-- **`dedupe.rs` mirrors the server's suppression rule** because REST `/ev` has
-  none of its own. Its `+1 point` comparison needs the epsilon margin; a bare
-  `>=` silently swallows real alerts.
-- **Cold-start seeding** means a restart publishes nothing until the next
-  genuine crossing. That is deliberate, not a bug.
-- **Silence is the normal state, and the heartbeat is how the bot says so.**
-  A live NFL Sunday check found the best price across twelve books at +2.91% EV
-  against a 3.5% threshold, and on another game not one positive-EV price
-  existed. `PollOutcome.best_ev` records the strongest EV seen *including
-  filtered-out prices* precisely so the heartbeat can report the near-miss.
-  Absence of a heartbeat is the alarm. Do not reintroduce a timer-based silence
-  warning: it cannot distinguish "market is tight" from "poller is dead", which
-  is the only question that matters.
+## Invariants — these look arbitrary and are not
 
-Tests use captured live responses in `tests/fixtures/`, not hand-written JSON.
-That is how the casing inconsistency, the non-integer `bookPrice`, and the
-nullable `canonicalEventId` were all caught. Prefer re-capturing a fixture over
-inventing one.
+Each of these was a real bug or a near miss. Changing one without reading its
+reasoning will reintroduce the failure.
 
-## What this is
+**1. `numReplicas = 1`, forever.** Suppression state is in memory per process.
+A second replica is a second bot with an empty suppressor: it republishes
+everything the first already sent *and* burns a second copy of the monthly
+quota. Horizontal scaling is always wrong here. Enforced in `railway.toml`.
 
-A Rust service that posts a Discord message when a positive expected value
-(+EV) moneyline price appears at one of the operator's books. EV is computed
-**by the Owls Insight API**, not here. This project filters and delivers; it
-does not price.
+**2. Dedupe ageing must stay sport-scoped.** `mark_absent_in_sport` takes a
+sport for a reason. An unscoped version ages every other sport's keys once per
+sport polled, so at **three or more active sports** every key is evicted inside
+a single cycle and republishes. This shipped, passed 128 tests, and collapsed
+suppression entirely — because no test used more than two sports. Two is exactly
+the boundary that hides it.
 
-## Toolchain
+**3. The `+1 point` rise check needs its epsilon margin.** `4.1 + 1.0` is not
+exactly `5.1` in f64. A bare `>=` on the raw sum silently swallows the alert the
+operator most wants.
 
-Rust 1.92.0, Python 3.13.2, Docker 27.4.0, git 2.39.5, gh 2.95.0.
-**No Node/npm** — anything Node-based (including n8n) requires Docker.
+**4. Cold-start seeding is deliberate.** A restart records the live board and
+publishes nothing until the next genuine crossing. Without it every restart
+dumps the whole board into the alert channel. The cost — a quiet window after
+each deploy — is accepted, not a bug.
+
+**5. Filter order is immovable-before-tunable.** The trade bar is checked
+*before* the operator's threshold because the order decides which reason gets
+*reported*. Telling someone "your 2.5% threshold blocked this" when the server's
+unchangeable 4% exchange bar also blocks it sends them to tune a knob that
+cannot help.
+
+**6. Never reintroduce a timer-based silence warning.** It can only say "either
+nothing cleared the threshold or the poller has stopped" — the two states that
+need telling apart. The heartbeat replaced it: absence of a heartbeat is the
+alarm, and its content explains the quiet.
+
+**7. `best_ev` must carry its outcome.** Reporting "best price seen: +4.46%"
+beside "1 alert sent" invites the assumption they are the same price. They
+frequently are not. `BestEvOutcome` records Published / Seeded / Suppressed /
+Rejected-with-reason.
+
+**8. Count deliveries, not queue pushes.** `outcome.published` counts pushes
+onto the publish queue. The heartbeat must report what Discord actually
+accepted, or the bot claims to have told you something it has not.
+
+**9. Fixtures are captured from the live API, never hand-written.** That is how
+the per-struct casing inconsistency, the non-integer `bookPrice`, and the
+nullable `canonicalEventId` were all caught. Re-capture rather than invent.
+
+---
 
 ## Owls Insight API — load-bearing facts
 
 Base URL `https://api.owlsinsight.com`. Plan: **MVP + WebSocket add-on**.
 
 - **Auth is `Authorization: Bearer <key>`.** Explicitly *not* `x-api-key`.
-  The WebSocket is different again: the key goes in the Socket.IO **query
-  string**, not a header and not the auth object.
-- **There is no Rust SDK.** TypeScript, Python, Go, and Kotlin only. The
-  OpenAPI 3.1 spec at `https://owlsinsight.com/openapi.json` (291 schemas) is
-  the source of truth for types.
-- **EV is moneyline-only and pregame-only.** No spreads, totals, props, or
-  in-play. This is a product limit with no workaround — do not design around
-  the hope that it changes.
+- **There is no Rust SDK.** The OpenAPI 3.1 spec at
+  `https://owlsinsight.com/openapi.json` (291 schemas) is the type source of truth.
+- **EV is moneyline-only and pregame-only.** No spreads, totals, props, in-play.
+  A product limit with no workaround.
 - **EV is not available over the WebSocket.** All 38 WebSocket events carry raw
-  or consensus odds. EV comes only from REST `/api/v1/{sport}/ev` or the
-  `ev.found` webhook. The WebSocket add-on cannot deliver the core signal.
-- **Server-side dedup is a feature, not an obstacle.** `ev.found` fires at most
-  once per 15 min per event/venue/side, then suppresses for 2 hours unless EV
-  rises ≥1 point. Never bypass it. Client-side filters may only ever *narrow*.
-- **`ev.found` sends no backfill** — "only the crossings that come after"
-  registration. The channel is silent after deploy until a new crossing. The
-  REST poller covers the current board.
-- **The webhook payload is thinner than the REST response.** It omits
-  `booksInConsensus`, `kellyFraction`, `edgePp`, `roi`, `fairUnadjusted`, and
-  `tradeable`/`reason`. Recover them by joining the poller's cached board on
-  `canonicalEventId`.
-- **EV > 25% is dropped server-side as a data error.** Real edges are
-  single-digit to low double-digit percent. Treat a huge number as a bug.
+  or consensus odds. EV comes only from REST `/ev` or the `ev.found` webhook.
+  The WebSocket add-on cannot deliver the core signal.
+- **EV > 25% is dropped server-side as a data error.** Treat a huge number as a bug.
+- **Server-side dedup is a feature.** `ev.found` fires at most once per 15 min
+  per event/venue/side. Client filters may only ever *narrow*.
 
-### Filter mismatch between the two surfaces
+### Silence is the normal state
 
-| Filter | REST `/ev` | Webhook `ev_found` |
+Measured live on an NFL Sunday (design §11): **all ten sports returned zero
+opportunities at `min_ev=0`** — not one positive-EV price anywhere, on the
+busiest day of the US betting week. Hand-computed on Cardinals @ Rams, the best
+of twelve books was +2.91%; on Chargers @ Chiefs it was −1.37%.
+
+Why: the fair is Pinnacle de-vigged **minus a full percentage point**, so a book
+must beat the line by more than a point to show *any* positive EV. Expect alerts
+measured in per-day, not per-hour.
+
+### Effective floor = max(operator threshold, server trade bar)
+
+| Venue type | Server bar | Notes |
 |---|---|---|
-| EV floor | `min_ev` — any number | `min_ev` — **enum: 1, 2, 3, 5, 8** |
-| Book | `book` — exactly one | `venues` — a list, 11 allowed keys |
-| Exchanges | `venues=true` | `kinds: [book\|venue]` |
-| Sports | one per call | `sports` — a list |
+| Sportsbook | 2% | operator's threshold usually binds |
+| Exchange / prediction market | **4%** | plus a bid, ≤4¢ spread, ≥$50 at ask |
 
-The operator's 3.5% threshold is **not expressible server-side**. Register at
-`min_ev: 3`, cut at `> 3.5` in the receiver.
-
-### Trade bar sets the real floor
-
-`ev.found` only fires on *tradeable* prices: sportsbooks need ≥2% EV; exchanges
-and prediction markets need ≥4% plus a bid, a spread ≤4¢, and ≥$50 at the ask.
-So at a 3.5% setting, BetMGM/FanDuel/DraftKings/bet365 alert at 3.5%, while
-Novig/Kalshi/Polymarket effectively floor at **4%**.
+The exchange requirements are **not expressible in config**. Lowering
+`min_ev_pct` does nothing for Novig, Kalshi, or Polymarket.
 
 ### Book keys
 
 In scope: `betmgm` `fanduel` `draftkings` `bet365` `novig` `kalshi` `polymarket`.
 
 - `polymarket` is **refused by the webhook allowlist** → REST-only, needs
-  `venues=true`. This is why the hybrid design is required rather than optional.
-- `kalshi` needs `kinds` to include `venue`.
-- **Fanatics is out of scope and cannot be added.** Two products share the
-  name: the Fanatics *Sportsbook* has no public feed anywhere in the API, and
-  Fanatics *Markets* (`fanaticsmarkets`) is a Nadex-settled prediction market
-  covering only `boxing, golf` — neither is an EV sport. Do not re-litigate
-  this; no path produces Fanatics EV.
+  `venues=true`. This is why the hybrid design is required.
+- **Fanatics is out of scope and cannot be added.** The Fanatics *Sportsbook*
+  has no public feed; Fanatics *Markets* is a Nadex prediction market covering
+  `boxing, golf` only. Do not re-litigate.
 
 ### Sports in scope (10)
 
-`nfl nba mlb nhl ncaaf ncaab wnba soccer tennis mma` — all within `ev.found`
-coverage. The 4 esports keys (`cs2 dota2 lol valorant`) are deliberately excluded.
+`nfl nba mlb nhl ncaaf ncaab wnba soccer tennis mma`. The 4 esports keys are
+deliberately excluded.
 
-### Quota arithmetic
+### Quota arithmetic and gating
 
-MVP: **300,000 req/month**, 400/min, 15 concurrent. Naive polling of all 10
-sports at 60s is **144% of quota** — it does not fit.
+MVP: **300,000 req/month**, 400/min, 15 concurrent. All ten sports at 60s is
+**144% of quota**. Gating fixes it — poll only sports with an unstarted game in
+the lookahead window.
 
-The fix is schedule gating: poll `/ev` only for sports with an unstarted game in
-the lookahead window. EV is pregame-only, so a sport with no slate is worth zero
-requests. At ~5 active sports and 60s: ~218,000/month (73%).
-
-**But `/api/v1/schedule` does not cover all ten sports.** Its `sport` parameter
-accepts only `nfl, ncaaf, mlb, nba, wnba, nhl, tennis, soccer, ufc` —
-**`ncaab` is absent** and **`mma` exists only as `ufc`**. `/api/v1/{sport}/schedule`
-excludes `mma` too. Use **`GET /api/v1/{sport}/events`**, which covers both
-`ncaab` and `mma`. So gating is three calls per refresh, not one:
+**`/api/v1/schedule` does not cover all ten sports.** Verified against the live
+API: `?sport=ncaab` and `?sport=mma` both return **HTTP 400 Unknown sport**.
+Structural, not seasonal. So gating is three calls:
 
 | Call | Covers |
 |---|---|
@@ -179,63 +210,84 @@ excludes `mma` too. Use **`GET /api/v1/{sport}/events`**, which covers both
 | `GET /api/v1/ncaab/events` | ncaab |
 | `GET /api/v1/mma/events` | mma |
 
-Use **`days=2`** — `days=1` returns only the current calendar day in `tz`
-(default `America/New_York`), so a late-evening refresh misses tomorrow's slate.
+`mma` is not a rename of `ufc`: the captured fixture holds 104 MMA events across
+11 promotions, only 27 of them UFC.
 
-**REST `/ev` has no dedup of its own.** It is a full board snapshot returning the
-same qualifying opportunity on every poll. The 15-min/2-hour/+1-point rule is a
-property of `ev.found` *firing*, not of the data. The poller must mirror that
-rule client-side, share dedupe state with the webhook path, and **seed silently
-on cold start** — otherwise every restart dumps the whole live board into the
-channel.
+Use **`days=2`** — `days=1` covers only the current calendar day in `tz`
+(default `America/New_York`), so an evening refresh misses tomorrow.
 
-**`venues=true` is warm-on-demand.** Kalshi/Polymarket prices appear ~15s after
-the first request and stay on "while you keep asking." Going quiet on a sport can
-switch those quotes *off*, not merely make them stale — so venue-carrying sports
-need a floor on their poll interval and must be last to degrade.
+**REST `/ev` has no dedup of its own.** It is a full board snapshot returning
+the same opportunity every poll. See invariants 2–4.
 
-Read `X-RateLimit-Remaining-Month` on every response and degrade the interval as
-budget depletes rather than stopping dead at the cap.
+**`venues=true` is warm-on-demand.** Kalshi/Polymarket quotes appear ~15s after
+you start asking and stay only "while you keep asking". Going quiet can switch
+them *off*, so venue-carrying sports have an interval ceiling
+(`VENUE_MAX_INTERVAL`) and degrade last.
+
+Polling is **sequential, one request in flight**. Past 15 concurrent the API
+returns an immediate 429 rather than queueing.
+
+---
+
+## Deployment
+
+Railway, built from the [Dockerfile](Dockerfile). See
+[docs/deploy-railway.md](docs/deploy-railway.md).
+
+Two runtime-image requirements that are easy to lose:
+
+- **`ca-certificates` must be installed.** rustls verifies TLS against the
+  system root store and `debian-slim` ships without it; every HTTPS call fails
+  with a certificate error that reads like a network problem.
+- **`config/` must be copied beside the binary**, because `Config::load`
+  resolves `config/default.toml` relative to the working directory.
+
+On Railway specifically: every deploy is a cold start (invariant 4), config
+hot-reload is inert because the filesystem is ephemeral — tune with `EVBOT_*`
+environment variables instead — and there is no healthcheck because phase 1
+binds no port.
+
+## Phase 2 notes (not yet built)
 
 ### Webhook signature verification
 
 Getting this wrong fails silently and accepts forged alerts.
 
 1. Read the **raw body bytes before any JSON parsing.** The HMAC covers the raw
-   body; re-serializing changes the bytes and breaks verification.
+   body; re-serializing breaks verification.
 2. HMAC-SHA256 over `t` + `"."` + raw body, keyed with the **full secret
    including the `whsec_` prefix**, as UTF-8.
-3. **Constant-time compare** (use `subtle`), never `==`.
+3. **Constant-time compare** (`subtle`), never `==`.
 4. Reject `t` more than 5 minutes from local clock.
-5. During secret rotation the header carries **two** `v1` values — accept either.
+5. During rotation the header carries **two** `v1` values — accept either.
 6. Dedupe on event `id`, identical across retries.
-7. **Return 2xx before posting to Discord.** The budget is 10s (3s to connect)
-   and a redirect counts as a failure. Hand off to a worker; never post on the
-   request path.
+7. **Return 2xx before posting to Discord.** Budget is 10s; a redirect counts as
+   a failure. Hand off to a worker.
 
-Failure consequences: 5 consecutive failures → backoff; 50 failures plus 72h
-without success → `auto_disabled`, recoverable only by `PATCH {"enabled": true}`.
+5 consecutive failures → backoff; 50 failures plus 72h without success →
+`auto_disabled`, recoverable only by `PATCH {"enabled": true}`.
 
 ### Webhook URL requirement
 
-HTTPS, default port, **public hostname**. IP addresses and private/internal
-hosts are refused at registration *and on every delivery*. The webhook path
-cannot be developed against localhost — use a tunnel or build the polling path
-first.
+HTTPS, default port, **public hostname**. IPs and private hosts are refused at
+registration *and on every delivery*. Cannot be developed against localhost.
+
+The webhook payload is **thinner** than REST: it omits `booksInConsensus`,
+`kellyFraction`, `edgePp`, `roi`, `fairUnadjusted`, `tradeable`/`reason`.
+Recover them by joining the poller's board on `canonicalEventId`.
 
 ## Working agreements
 
-- **Git and GitHub are performed manually by the operator**, who is learning
-  them. Explain commands and let them run them. Do not run `git commit`,
-  `git push`, or create branches/PRs unless explicitly asked.
+- **Git**: the operator asked Claude to handle git operations for now and will
+  take them back when they say so. They are learning git and GitHub, so explain
+  what a command does rather than running it silently.
 - Treat `meta.freshness.stale`, `board_age_ms`, and `quote_age_ms` as
-  first-class. The API tells us when its own data is stale; surface it rather
-  than hiding it.
-- Webhooks are documented as **beta** ("shape is stable, signals still
-  evolving"). Parse defensively — an unknown field is not an error.
-- Secrets (`OWLS_API_KEY`, `OWLS_WEBHOOK_SECRET`, `DISCORD_TOKEN`) come from the
-  environment, never the config file. Every operator-facing criterion belongs in
-  hot-reloadable config, never a compiled constant.
+  first-class. The API says when its own data is stale; surface it.
+- Webhooks are **beta** ("shape is stable, signals still evolving"). Parse
+  defensively — an unknown field is not an error. `Kind` already uses a lenient
+  deserializer for this reason; `Side` deliberately does not.
+- Secrets come from the environment, never a config file. Operator criteria
+  belong in config, never a compiled constant.
 
 ## Reference
 
