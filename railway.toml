@@ -1,0 +1,16 @@
+# Railway deployment config.
+#
+# numReplicas MUST stay 1. Suppression state lives in memory, per process, so a
+# second replica is a second bot with its own empty suppressor: it would publish
+# every opportunity the first one had already alerted on, and burn a second copy
+# of the monthly API quota. Scaling this service horizontally is always wrong.
+
+[build]
+builder = "NIXPACKS"
+buildCommand = "cargo build --release --bin discord_ev_bot"
+
+[deploy]
+startCommand = "./target/release/discord_ev_bot"
+numReplicas = 1
+# A poller that exits has failed; always bring it back.
+restartPolicyType = "ALWAYS"

@@ -1,0 +1,6 @@
+# Pinned because the crate uses edition 2024, which needs rustc >= 1.85.
+# Build images often ship something older, and the failure is a confusing
+# edition error rather than an obvious "your Rust is too old".
+[toolchain]
+channel = "1.92"
+profile = "minimal"
