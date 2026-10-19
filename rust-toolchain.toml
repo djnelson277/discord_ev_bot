@@ -1,6 +1,12 @@
 # Pinned because the crate uses edition 2024, which needs rustc >= 1.85.
 # Build images often ship something older, and the failure is a confusing
 # edition error rather than an obvious "your Rust is too old".
+#
+# rust-analyzer is listed explicitly so editors use the toolchain's own copy
+# rather than whatever the extension bundles. Without it, VS Code warns that
+# the pinned toolchain is too old for its shipped rust-analyzer and falls back,
+# which costs you autocomplete and inline diagnostics.
 [toolchain]
 channel = "1.92"
 profile = "minimal"
+components = ["rust-analyzer", "rustfmt", "clippy"]
