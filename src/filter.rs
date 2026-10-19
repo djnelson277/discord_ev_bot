@@ -55,9 +55,12 @@ pub fn effective_trade_bar(kind: Option<Kind>) -> f64 {
 
 /// Whether this opportunity should reach Discord.
 ///
-/// Checks run most-specific-first so the reported reason is the most
-/// informative one: a 40% EV price on a disallowed book is reported as suspect
-/// data, not as a book problem.
+/// The order of checks determines which reason gets *reported*, and that
+/// matters more than it looks. The rule is **immovable constraints before
+/// tunable ones**: telling an operator "your 2.5% threshold blocked this" when
+/// the server's unchangeable 4% exchange bar would also have blocked it sends
+/// them to adjust a knob that cannot help. So the trade bar is checked before
+/// the threshold, and suspect data before everything.
 pub fn is_publishable(opp: &Opportunity, cfg: &Config) -> Verdict {
     // 1. Implausible data outranks everything. A price this good is a bug, and
     //    acting on it is the most expensive mistake available here.
@@ -75,17 +78,12 @@ pub fn is_publishable(opp: &Opportunity, cfg: &Config) -> Verdict {
         });
     }
 
-    // 3. The operator's threshold, strictly greater than.
-    if opp.ev_pct <= cfg.min_ev_pct {
-        return Verdict::Reject(RejectReason::BelowThreshold {
-            ev: opp.ev_pct,
-            threshold: cfg.min_ev_pct,
-        });
-    }
-
-    // 4. The trade bar. Prefer the server's own verdict; derive it only when
-    //    the field is absent, since the server also weighs liquidity we cannot
-    //    see (bid present, spread, size at the ask).
+    // 3. The trade bar — an immovable server rule, so it is reported in
+    //    preference to the operator's own threshold.
+    //
+    //    Prefer the server's own verdict and derive it only when the field is
+    //    absent, since the server also weighs liquidity we cannot see: a bid
+    //    being present, the spread, and the size available at the ask.
     match opp.tradeable {
         Some(true) => {}
         Some(false) => {
@@ -104,6 +102,16 @@ pub fn is_publishable(opp: &Opportunity, cfg: &Config) -> Verdict {
                 });
             }
         }
+    }
+
+    // 4. The operator's threshold, strictly greater than. Checked AFTER the
+    //    trade bar so a price the server would refuse anyway is never blamed
+    //    on a setting the operator could change.
+    if opp.ev_pct <= cfg.min_ev_pct {
+        return Verdict::Reject(RejectReason::BelowThreshold {
+            ev: opp.ev_pct,
+            threshold: cfg.min_ev_pct,
+        });
     }
 
     // 5. Consensus minimum, if configured.

@@ -3,6 +3,7 @@
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use chrono::{Datelike, Utc};
@@ -208,18 +209,28 @@ pub async fn run(
         venue_sports: HashSet::new(),
     };
 
+    // Counts messages Discord actually accepted, so the heartbeat can report
+    // deliveries rather than queue pushes. Conflating them let the bot claim
+    // "1 alert sent" for a message Discord had rejected.
+    let delivered = Arc::new(AtomicUsize::new(0));
+
     let publish_queue = Arc::clone(&queue);
     let publish_token = shutdown.clone();
+    let publish_delivered = Arc::clone(&delivered);
     let publisher_task = tokio::spawn(async move {
         loop {
             match publish_queue.pop() {
                 Some(alert) => {
                     let embed = build_embed(&alert.event, &alert.opportunity, alert.enriched);
-                    if let Err(err) = publisher.post_embed(&embed).await {
+                    match publisher.post_embed(&embed).await {
+                        Ok(()) => {
+                            publish_delivered.fetch_add(1, Ordering::Relaxed);
+                        }
                         // Logged, not retried: by the time a Discord failure
                         // resolves the price is usually gone, and a retry queue
-                        // would publish dead alerts.
-                        error!(error = %err, "failed to publish alert");
+                        // would publish dead alerts. The heartbeat reports the
+                        // shortfall so a silent failure cannot hide.
+                        Err(err) => error!(error = %err, "failed to publish alert"),
                     }
                 }
                 None => {
@@ -237,7 +248,8 @@ pub async fn run(
     let mut health_due = Instant::now();
     let mut gating_failures: u32 = 0;
     let mut heartbeat_due = Instant::now() + Duration::from_secs(initial.heartbeat_secs);
-    let mut alerts_since_heartbeat: usize = 0;
+    let mut queued_since_heartbeat: usize = 0;
+    let mut delivered_at_last_heartbeat: usize = 0;
     let mut best_since_heartbeat: Option<crate::poller::BestEv> = None;
 
     while !shutdown.is_cancelled() {
@@ -293,7 +305,7 @@ pub async fn run(
         // poll_once awaits a network round-trip per sport, so an alert pushed
         // while polling sport 1 of 10 is normally already sent by the time
         // poll_once returns and the length is unchanged.
-        alerts_since_heartbeat += outcome.published;
+        queued_since_heartbeat += outcome.published;
         if let Some(best) = &outcome.best_ev {
             if best_since_heartbeat
                 .as_ref()
@@ -327,18 +339,21 @@ pub async fn run(
         // "either nothing cleared the threshold or the poller has stopped" --
         // the two states the operator most needs told apart.
         if Instant::now() >= heartbeat_due {
+            let delivered_total = delivered.load(Ordering::Relaxed);
             let msg = heartbeat_message(
                 &ctx.active,
                 best_since_heartbeat.take(),
                 cfg.min_ev_pct,
-                alerts_since_heartbeat,
+                queued_since_heartbeat,
+                delivered_total.saturating_sub(delivered_at_last_heartbeat),
                 &quota,
             );
             info!(heartbeat = %msg, "heartbeat");
             if let Err(err) = ops_publisher.post_embed(&heartbeat_embed(&msg)).await {
                 error!(error = %err, "failed to publish heartbeat");
             }
-            alerts_since_heartbeat = 0;
+            queued_since_heartbeat = 0;
+            delivered_at_last_heartbeat = delivered_total;
             heartbeat_due = Instant::now() + Duration::from_secs(cfg.heartbeat_secs);
         }
 

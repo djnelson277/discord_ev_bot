@@ -9,7 +9,7 @@ use discord_ev_bot::owls::client::OwlsClient;
 use discord_ev_bot::owls::quota::{
     MONTHLY_QUOTA_MVP, Pacing, QuotaSnapshot, VENUE_MAX_INTERVAL, next_interval,
 };
-use discord_ev_bot::poller::{PollContext, poll_once};
+use discord_ev_bot::poller::{BestEvOutcome, PollContext, poll_once};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -621,4 +621,89 @@ async fn an_empty_board_records_no_best_ev() {
     c.seeded.insert("nba".to_string());
     let out = poll_once(&mut c, &cfg(&server.uri()), Instant::now()).await;
     assert!(out.best_ev.is_none());
+}
+
+#[tokio::test]
+async fn best_ev_records_why_it_did_not_alert() {
+    // A heartbeat reading "best price seen: +4.46%" next to "1 alert sent"
+    // invites the operator to assume the 4.46% was the alert. It was not. The
+    // outcome must travel with the number.
+    let server = MockServer::start().await;
+    let board = r#"{"success":true,"data":[{
+        "sport":"tennis","homeTeam":"Compagnucci","awayTeam":"Marino",
+        "commenceTime":"2026-10-18T22:00:00.000Z",
+        "canonicalEventId":"tennis:Marino@Compagnucci-20261018",
+        "opportunities":[{"book":"novig","side":"home","team":"Compagnucci",
+            "bookPrice":150,"evPct":0.93,"fairProbability":0.4,"kind":"venue",
+            "tradeable":false,"reason":"EV under 4%"}]}],
+        "meta":{"sport":"tennis","timestamp":"2026-10-18T20:00:00.000Z",
+                "freshness":{"ageSeconds":2,"stale":false}}}"#;
+    mount_ev(&server, "tennis", board.to_string()).await;
+
+    let mut c = ctx(&server, &["tennis"]);
+    let mut conf = cfg(&server.uri());
+    conf.sports = vec!["tennis".into()];
+    c.seeded.insert("tennis".to_string());
+
+    let out = poll_once(&mut c, &conf, Instant::now()).await;
+    let best = out.best_ev.expect("must record the near-miss");
+
+    match best.outcome {
+        BestEvOutcome::Rejected(ref why) => assert!(
+            why.contains("4%") || why.to_lowercase().contains("tradeable"),
+            "the reason must name the real blocker, got: {why}"
+        ),
+        ref other => panic!("expected Rejected, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn best_ev_marks_a_seeded_price_as_seeded_not_rejected() {
+    // The most likely explanation for the operator's 4.46% mystery: it was the
+    // first poll of that sport, so it was recorded silently by design. That is
+    // a completely different thing from being filtered out, and the heartbeat
+    // must not conflate them.
+    let server = MockServer::start().await;
+    mount_ev(&server, "nba", board_with_ev(6.0)).await;
+    let mut c = ctx(&server, &["nba"]); // NOT seeded
+    let out = poll_once(&mut c, &cfg(&server.uri()), Instant::now()).await;
+
+    let best = out.best_ev.expect("must record it even while seeding");
+    assert!(
+        matches!(best.outcome, BestEvOutcome::Seeded),
+        "got {:?}",
+        best.outcome
+    );
+}
+
+#[tokio::test]
+async fn best_ev_marks_a_published_price_as_published() {
+    let server = MockServer::start().await;
+    mount_ev(&server, "nba", board_with_ev(6.0)).await;
+    let mut c = ctx(&server, &["nba"]);
+    c.seeded.insert("nba".to_string());
+    let out = poll_once(&mut c, &cfg(&server.uri()), Instant::now()).await;
+    let best = out.best_ev.unwrap();
+    assert!(
+        matches!(best.outcome, BestEvOutcome::Published),
+        "got {:?}",
+        best.outcome
+    );
+}
+
+#[tokio::test]
+async fn best_ev_marks_a_suppressed_price_as_suppressed() {
+    let server = MockServer::start().await;
+    mount_ev(&server, "nba", board_with_ev(6.0)).await;
+    let mut c = ctx(&server, &["nba"]);
+    let conf = cfg(&server.uri());
+    let t = Instant::now();
+    poll_once(&mut c, &conf, t).await; // seeds
+    let out = poll_once(&mut c, &conf, t + Duration::from_secs(60)).await;
+    let best = out.best_ev.unwrap();
+    assert!(
+        matches!(best.outcome, BestEvOutcome::Suppressed),
+        "got {:?}",
+        best.outcome
+    );
 }

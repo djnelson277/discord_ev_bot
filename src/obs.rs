@@ -11,7 +11,7 @@
 use std::collections::BTreeSet;
 
 use crate::owls::quota::{MONTHLY_QUOTA_MVP, Pacing, QuotaSnapshot, is_degraded};
-use crate::poller::BestEv;
+use crate::poller::{BestEv, BestEvOutcome};
 
 /// Initialises structured logging to stdout.
 ///
@@ -80,11 +80,18 @@ pub fn quota_warning(q: &QuotaSnapshot, pacing: Pacing, _warn_at: f64) -> Option
 /// quiet, and both indistinguishable from a crash.
 ///
 /// Absence of a heartbeat is the alarm; its content explains the quiet.
+///
+/// `queued` counts alerts pushed onto the publish queue and `delivered` counts
+/// those Discord actually accepted. They are reported separately because an
+/// earlier version conflated them and would say "1 alert sent" for a message
+/// Discord had rejected — the bot claiming to have told you something it had
+/// not.
 pub fn heartbeat_message(
     active: &BTreeSet<String>,
     best: Option<BestEv>,
     threshold_pct: f64,
-    alerts_since_last: usize,
+    queued: usize,
+    delivered: usize,
     quota: &QuotaSnapshot,
 ) -> String {
     let mut parts = Vec::new();
@@ -102,17 +109,45 @@ pub fn heartbeat_message(
         ));
     }
 
-    parts.push(match alerts_since_last {
-        0 => "No alerts sent since the last report.".to_string(),
-        1 => "1 alert sent since the last report.".to_string(),
-        n => format!("{n} alerts sent since the last report."),
+    parts.push(match delivered {
+        0 if queued == 0 => "No alerts since the last report.".to_string(),
+        n => format!("{n} alert(s) delivered since the last report."),
     });
 
+    if queued > delivered {
+        parts.push(format!(
+            "WARNING: {} alert(s) were queued but never accepted by Discord — check the logs \
+             for publish failures.",
+            queued - delivered
+        ));
+    }
+
     parts.push(match best {
-        Some(b) => format!(
-            "Best price seen: {:+.2}% EV at {} on {} ({}). Your threshold is >{:.2}%.",
-            b.ev_pct, b.book, b.matchup, b.sport, threshold_pct
-        ),
+        Some(b) => {
+            let verdict = match &b.outcome {
+                BestEvOutcome::Published => "alerted \u{2713}".to_string(),
+                // Not a rejection. Saying so plainly stops a normal restart
+                // looking like a misconfiguration.
+                BestEvOutcome::Seeded => format!(
+                    "not alerted: this was the first poll of {} since start, so the board was \
+                     recorded silently and alerts begin from the next crossing",
+                    b.sport
+                ),
+                BestEvOutcome::Suppressed => {
+                    "not alerted: already alerted recently, still inside the suppression window"
+                        .to_string()
+                }
+                // The reason is the server's where one applies, because the
+                // operator's threshold is irrelevant to a price the server
+                // would refuse anyway.
+                BestEvOutcome::Rejected(why) => format!("not alerted: {why}"),
+            };
+            format!(
+                "Best price seen: {:+.2}% EV at {} on {} ({}) — {verdict}. Your threshold is \
+                 >{:.2}%.",
+                b.ev_pct, b.book, b.matchup, b.sport, threshold_pct
+            )
+        }
         None if active.is_empty() => String::new(),
         // Distinct from "nothing cleared the bar": not one book beat the
         // conservative fair on any game, which is what an efficient market

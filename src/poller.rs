@@ -61,6 +61,28 @@ pub struct BestEv {
     pub book: String,
     pub sport: String,
     pub matchup: String,
+    /// What actually happened to this price.
+    ///
+    /// Travels with the number because a heartbeat reading "best price seen:
+    /// +4.46%" beside "1 alert sent" invites the operator to assume they are
+    /// the same price. They frequently are not, and the difference is the only
+    /// thing that tells them whether tuning their threshold would have helped.
+    pub outcome: BestEvOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BestEvOutcome {
+    /// Passed every filter and reached the publish queue.
+    Published,
+    /// Recorded silently because this was the sport's first usable board.
+    /// Not a rejection — alerts begin from the next crossing.
+    Seeded,
+    /// Cleared the filters but was already alerted recently.
+    Suppressed,
+    /// Failed a filter. The string is the specific reason, which may be the
+    /// operator's threshold, the book allowlist, or the server's trade bar —
+    /// three very different things to learn.
+    Rejected(String),
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -154,52 +176,63 @@ pub async fn poll_once(ctx: &mut PollContext, cfg: &Config, now_mono: Instant) -
                     ctx.venue_sports.insert(sport.clone());
                 }
 
-                // Recorded before filtering, deliberately: a near-miss is the
-                // most informative thing the bot can say when it is quiet.
-                let better = out.best_ev.as_ref().is_none_or(|b| opp.ev_pct > b.ev_pct);
-                if better {
+                // Whether this is the cycle's strongest price is decided
+                // BEFORE filtering, because a near-miss is the most
+                // informative thing the bot can report when it is quiet. The
+                // outcome is stamped on at the end of the iteration, once it is
+                // actually known -- reporting the number without the outcome
+                // invites the operator to assume the best price was the alert.
+                let is_best = out.best_ev.as_ref().is_none_or(|b| opp.ev_pct > b.ev_pct);
+
+                let outcome = match is_publishable(opp, cfg) {
+                    Verdict::Reject(reason) => {
+                        out.rejected += 1;
+                        debug!(sport, book = %opp.book, %reason, "filtered out");
+                        BestEvOutcome::Rejected(reason.to_string())
+                    }
+                    Verdict::Publish => {
+                        let key = AlertKey {
+                            sport: sport.clone(),
+                            event_id: event.dedupe_key(),
+                            book: opp.book.clone(),
+                            side: opp.side,
+                        };
+                        seen_this_poll.insert(key.clone());
+
+                        if seeding {
+                            // Cold start: record without publishing. Otherwise
+                            // every restart dumps the live board into the
+                            // channel.
+                            ctx.suppressor.seed(&key, opp.ev_pct, now_mono);
+                            BestEvOutcome::Seeded
+                        } else {
+                            match ctx.suppressor.observe(&key, opp.ev_pct, now_mono) {
+                                Decision::Publish => {
+                                    out.published += 1;
+                                    ctx.queue.push(Alert {
+                                        event: event.clone(),
+                                        opportunity: opp.clone(),
+                                        enriched: is_enriched(opp),
+                                    });
+                                    BestEvOutcome::Published
+                                }
+                                Decision::Suppress => {
+                                    out.suppressed += 1;
+                                    BestEvOutcome::Suppressed
+                                }
+                            }
+                        }
+                    }
+                };
+
+                if is_best {
                     out.best_ev = Some(BestEv {
                         ev_pct: opp.ev_pct,
                         book: opp.book.clone(),
                         sport: sport.clone(),
                         matchup: format!("{} @ {}", event.away_team, event.home_team),
+                        outcome,
                     });
-                }
-
-                match is_publishable(opp, cfg) {
-                    Verdict::Reject(reason) => {
-                        out.rejected += 1;
-                        debug!(sport, book = %opp.book, %reason, "filtered out");
-                        continue;
-                    }
-                    Verdict::Publish => {}
-                }
-
-                let key = AlertKey {
-                    sport: sport.clone(),
-                    event_id: event.dedupe_key(),
-                    book: opp.book.clone(),
-                    side: opp.side,
-                };
-                seen_this_poll.insert(key.clone());
-
-                if seeding {
-                    // Cold start: record without publishing. Otherwise every
-                    // restart dumps the whole live board into the channel.
-                    ctx.suppressor.seed(&key, opp.ev_pct, now_mono);
-                    continue;
-                }
-
-                match ctx.suppressor.observe(&key, opp.ev_pct, now_mono) {
-                    Decision::Publish => {
-                        out.published += 1;
-                        ctx.queue.push(Alert {
-                            event: event.clone(),
-                            opportunity: opp.clone(),
-                            enriched: is_enriched(opp),
-                        });
-                    }
-                    Decision::Suppress => out.suppressed += 1,
                 }
             }
         }
