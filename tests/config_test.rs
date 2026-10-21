@@ -226,3 +226,107 @@ fn the_shipped_config_includes_caesars_and_circa() {
         );
     }
 }
+
+// ------------------------------------------------------------- quiet hours
+
+fn with_quiet(start: &str, end: &str) -> Config {
+    Config::from_toml_str(&format!(
+        "quiet_hours_start = \"{start}\"\nquiet_hours_end = \"{end}\"\ntimezone = \"America/Denver\"\n"
+    ))
+    .unwrap()
+}
+
+fn at(local: &str) -> chrono::DateTime<chrono::Utc> {
+    // a local Denver wall-clock time, converted to the UTC the bot sees
+    use chrono::TimeZone;
+    let naive = chrono::NaiveDateTime::parse_from_str(local, "%Y-%m-%d %H:%M").unwrap();
+    chrono_tz::America::Denver
+        .from_local_datetime(&naive)
+        .unwrap()
+        .with_timezone(&chrono::Utc)
+}
+
+#[test]
+fn quiet_window_covers_the_configured_span() {
+    let _g = guard();
+    let cfg = with_quiet("02:30", "09:30");
+    assert!(
+        cfg.is_quiet_at(at("2026-10-21 02:30")),
+        "start is inclusive"
+    );
+    assert!(cfg.is_quiet_at(at("2026-10-21 06:00")));
+    assert!(cfg.is_quiet_at(at("2026-10-21 09:29")));
+}
+
+#[test]
+fn the_bot_wakes_exactly_at_the_end_time() {
+    // End is exclusive: at 09:30 it is polling again, not still asleep.
+    let _g = guard();
+    let cfg = with_quiet("02:30", "09:30");
+    assert!(!cfg.is_quiet_at(at("2026-10-21 09:30")));
+    assert!(!cfg.is_quiet_at(at("2026-10-21 12:00")));
+    assert!(!cfg.is_quiet_at(at("2026-10-21 02:29")));
+}
+
+#[test]
+fn a_window_crossing_midnight_still_works() {
+    // 23:00 -> 08:00 wraps the date boundary; a naive start<t<end comparison
+    // would treat the whole night as awake.
+    let _g = guard();
+    let cfg = with_quiet("23:00", "08:00");
+    assert!(cfg.is_quiet_at(at("2026-10-21 23:30")));
+    assert!(cfg.is_quiet_at(at("2026-10-21 02:00")));
+    assert!(!cfg.is_quiet_at(at("2026-10-21 09:00")));
+    assert!(!cfg.is_quiet_at(at("2026-10-21 22:00")));
+}
+
+#[test]
+fn quiet_hours_are_off_when_unconfigured() {
+    let _g = guard();
+    let cfg = Config::from_toml_str("min_ev_pct = 2.5\n").unwrap();
+    assert!(!cfg.is_quiet_at(at("2026-10-21 04:00")));
+}
+
+#[test]
+fn quiet_hours_follow_daylight_saving() {
+    // The whole reason for a named zone rather than a UTC offset. 06:00 local
+    // is inside the window in both MDT (summer) and MST (winter); a hardcoded
+    // offset would silently shift the window by an hour in November.
+    let _g = guard();
+    let cfg = with_quiet("02:30", "09:30");
+    assert!(cfg.is_quiet_at(at("2026-07-15 06:00")), "MDT");
+    assert!(cfg.is_quiet_at(at("2026-12-15 06:00")), "MST");
+}
+
+#[test]
+fn rejects_a_malformed_time_or_unknown_zone() {
+    let _g = guard();
+    assert!(
+        Config::from_toml_str("quiet_hours_start = \"2:30pm\"\nquiet_hours_end = \"09:30\"\n")
+            .is_err()
+    );
+    assert!(
+        Config::from_toml_str("quiet_hours_start = \"25:00\"\nquiet_hours_end = \"09:30\"\n")
+            .is_err()
+    );
+    assert!(Config::from_toml_str("timezone = \"Mars/Olympus\"\n").is_err());
+}
+
+#[test]
+fn rejects_half_a_window() {
+    // One bound without the other is ambiguous; better to refuse than guess.
+    let _g = guard();
+    assert!(Config::from_toml_str("quiet_hours_start = \"02:30\"\n").is_err());
+    assert!(Config::from_toml_str("quiet_hours_end = \"09:30\"\n").is_err());
+}
+
+#[test]
+fn reports_when_the_bot_next_wakes() {
+    // The heartbeat needs this so a quiet-hours report says until when.
+    let _g = guard();
+    let cfg = with_quiet("02:30", "09:30");
+    assert_eq!(
+        cfg.quiet_until_label(),
+        Some("09:30 America/Denver".to_string())
+    );
+}

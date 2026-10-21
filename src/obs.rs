@@ -86,17 +86,39 @@ pub fn quota_warning(q: &QuotaSnapshot, pacing: Pacing, _warn_at: f64) -> Option
 /// earlier version conflated them and would say "1 alert sent" for a message
 /// Discord had rejected — the bot claiming to have told you something it had
 /// not.
-pub fn heartbeat_message(
-    active: &BTreeSet<String>,
-    best: Option<BestEv>,
-    threshold_pct: f64,
-    queued: usize,
-    delivered: usize,
-    quota: &QuotaSnapshot,
-) -> String {
+pub struct Heartbeat<'a> {
+    pub active: &'a BTreeSet<String>,
+    pub best: Option<BestEv>,
+    pub threshold_pct: f64,
+    /// Alerts pushed onto the publish queue.
+    pub queued: usize,
+    /// Alerts Discord actually accepted.
+    pub delivered: usize,
+    pub quota: &'a QuotaSnapshot,
+    /// Set while the operator's quiet window is active, e.g.
+    /// "09:30 America/Denver". Reported explicitly because during quiet hours
+    /// the active set is empty by choice, and saying "no sports in season"
+    /// would be false.
+    pub quiet_until: Option<String>,
+}
+
+pub fn heartbeat_message(h: Heartbeat<'_>) -> String {
+    let Heartbeat {
+        active,
+        best,
+        threshold_pct,
+        queued,
+        delivered,
+        quota,
+        quiet_until,
+    } = h;
     let mut parts = Vec::new();
 
-    if active.is_empty() {
+    if let Some(until) = &quiet_until {
+        parts.push(format!(
+            "Quiet hours — not polling until {until}. The window costs no API quota."
+        ));
+    } else if active.is_empty() {
         parts.push(
             "No sports in season or pre-game right now, so nothing is being polled.".to_string(),
         );
@@ -120,6 +142,16 @@ pub fn heartbeat_message(
              for publish failures.",
             queued - delivered
         ));
+    }
+
+    if quiet_until.is_some() {
+        if let Some(r) = quota.remaining_month {
+            let pct = 100.0 * r as f64 / MONTHLY_QUOTA_MVP as f64;
+            parts.push(format!(
+                "Quota: {r} requests left ({pct:.0}% of the month)."
+            ));
+        }
+        return parts.join(" ");
     }
 
     parts.push(match best {

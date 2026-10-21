@@ -3,6 +3,8 @@
 //! Every value an operator tunes lives here rather than in a compiled constant,
 //! so the running service can pick up changes without a redeploy.
 
+use chrono::{DateTime, NaiveTime, Utc};
+use chrono_tz::Tz;
 use figment::{
     Figment,
     providers::{Env, Format, Toml},
@@ -111,6 +113,15 @@ pub enum ConfigError {
     },
     #[error("{field} must not be empty — an empty list silently disables the bot")]
     Empty { field: &'static str },
+    #[error("{field} must be HH:MM in 24-hour form, got {got:?}")]
+    BadTime { field: &'static str, got: String },
+    #[error("unknown timezone {0:?} — use an IANA name such as America/Denver")]
+    BadTimezone(String),
+    #[error(
+        "quiet_hours_start and quiet_hours_end must both be set or both omitted — \
+         one without the other is ambiguous"
+    )]
+    HalfQuietWindow,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -151,6 +162,26 @@ pub struct Config {
     #[serde(default = "default_books")]
     pub books: Vec<String>,
 
+    /// Start of the nightly quiet window, local wall clock, `HH:MM`.
+    ///
+    /// During it the poller does not run at all. Suppressing only the alerts
+    /// would still spend the whole night's quota for nothing; skipping the
+    /// polls saves it.
+    #[serde(default)]
+    pub quiet_hours_start: Option<String>,
+
+    /// End of the quiet window, exclusive — at this time the bot is polling
+    /// again.
+    #[serde(default)]
+    pub quiet_hours_end: Option<String>,
+
+    /// IANA zone the quiet window is expressed in.
+    ///
+    /// A named zone, never a fixed offset: an offset silently shifts the whole
+    /// window by an hour twice a year when daylight saving changes.
+    #[serde(default = "default_timezone")]
+    pub timezone: String,
+
     /// When set, reject opportunities whose consensus count is known and lower.
     /// An absent count still publishes — failing open and marked beats
     /// suppressing invisibly.
@@ -175,6 +206,9 @@ fn default_gating_refresh() -> u64 {
 }
 fn default_lookahead_hours() -> i64 {
     48
+}
+fn default_timezone() -> String {
+    "America/Denver".to_string()
 }
 fn default_heartbeat_secs() -> u64 {
     1800
@@ -228,6 +262,43 @@ impl Config {
         let cfg: Config = f.merge(Env::prefixed("EVBOT_")).extract()?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// The configured timezone, or an error naming it.
+    pub fn tz(&self) -> Result<Tz, ConfigError> {
+        self.timezone
+            .parse()
+            .map_err(|_| ConfigError::BadTimezone(self.timezone.clone()))
+    }
+
+    /// Whether `instant` falls inside the operator's quiet window.
+    ///
+    /// Handles a window that crosses midnight (23:00 to 08:00): a naive
+    /// `start <= t < end` comparison would treat the entire night as awake.
+    /// Start is inclusive, end exclusive, so the bot is polling again exactly
+    /// at the end time.
+    pub fn is_quiet_at(&self, instant: DateTime<Utc>) -> bool {
+        let (Some(start), Some(end)) = (&self.quiet_hours_start, &self.quiet_hours_end) else {
+            return false;
+        };
+        let (Ok(start), Ok(end)) = (parse_hhmm("", start), parse_hhmm("", end)) else {
+            return false;
+        };
+        let Ok(tz) = self.tz() else { return false };
+
+        let now = instant.with_timezone(&tz).time();
+        if start <= end {
+            now >= start && now < end
+        } else {
+            // wraps midnight
+            now >= start || now < end
+        }
+    }
+
+    /// Human-readable wake time for the heartbeat, e.g. "09:30 America/Denver".
+    pub fn quiet_until_label(&self) -> Option<String> {
+        let end = self.quiet_hours_end.as_ref()?;
+        Some(format!("{end} {}", self.timezone))
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
@@ -287,6 +358,16 @@ impl Config {
         // An empty list is not a permissive default, it is a silent off switch:
         // no sports means nothing is polled, no books means everything is
         // rejected, and an empty active set also mutes the silence alarm.
+        self.tz()?;
+        match (&self.quiet_hours_start, &self.quiet_hours_end) {
+            (Some(a), Some(b)) => {
+                parse_hhmm("quiet_hours_start", a)?;
+                parse_hhmm("quiet_hours_end", b)?;
+            }
+            (None, None) => {}
+            _ => return Err(ConfigError::HalfQuietWindow),
+        }
+
         if self.sports.is_empty() {
             return Err(ConfigError::Empty { field: "sports" });
         }
@@ -315,4 +396,24 @@ impl Config {
         }
         Ok(())
     }
+}
+
+/// Parses `HH:MM` in 24-hour form.
+///
+/// Deliberately strict: `2:30pm`, `2:30` and `25:00` are rejected rather than
+/// coerced. A silently misread quiet window would have the bot asleep at the
+/// wrong time of day with nothing to indicate it, which is far worse than a
+/// startup error naming the bad value.
+fn parse_hhmm(field: &'static str, raw: &str) -> Result<NaiveTime, ConfigError> {
+    let bad = || ConfigError::BadTime {
+        field,
+        got: raw.to_string(),
+    };
+    let (h, m) = raw.split_once(':').ok_or_else(bad)?;
+    if h.len() != 2 || m.len() != 2 {
+        return Err(bad());
+    }
+    let h: u32 = h.parse().map_err(|_| bad())?;
+    let m: u32 = m.parse().map_err(|_| bad())?;
+    NaiveTime::from_hms_opt(h, m, 0).ok_or_else(bad)
 }

@@ -280,3 +280,120 @@ async fn posts_a_heartbeat_promptly_after_startup() {
         "expected a startup heartbeat within seconds, saw {posts}"
     );
 }
+
+fn write_quiet_config(
+    dir: &TempDir,
+    owls: &str,
+    discord: &str,
+    start: &str,
+    end: &str,
+) -> std::path::PathBuf {
+    let p = dir.path().join("quiet.toml");
+    std::fs::write(
+        &p,
+        format!(
+            r#"
+owls_base_url = "{owls}"
+discord_base_url = "{discord}"
+min_ev_pct = 2.5
+poll_interval_secs = 5
+gating_refresh_secs = 60
+heartbeat_secs = 1800
+lookahead_hours = 48
+timezone = "America/Denver"
+quiet_hours_start = "{start}"
+quiet_hours_end = "{end}"
+sports = ["nba"]
+books = ["fanduel"]
+"#
+        ),
+    )
+    .unwrap();
+    p
+}
+
+#[tokio::test]
+async fn makes_no_api_calls_during_quiet_hours() {
+    // Suppressing only the alerts would still spend the whole night's quota.
+    // A 7-hour window is ~29% of the day's requests, which matters when the
+    // month is pacing near the cap.
+    let owls = owls_mock().await;
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"id":"1"}"#))
+        .mount(&discord)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    // A window covering the whole day, so the test is independent of when it runs.
+    let cfg_path = write_quiet_config(&dir, &owls.uri(), &discord.uri(), "00:00", "23:59");
+
+    let token = CancellationToken::new();
+    let handle = tokio::spawn(run(cfg_path, secrets(), token.clone()));
+    tokio::time::sleep(Duration::from_millis(3_000)).await;
+    token.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
+
+    let owls_calls = owls.received_requests().await.unwrap().len();
+    assert_eq!(
+        owls_calls, 0,
+        "quiet hours must spend no quota at all, saw {owls_calls} request(s)"
+    );
+}
+
+#[tokio::test]
+async fn still_heartbeats_during_quiet_hours() {
+    // Absence of a heartbeat is the liveness alarm, so it must not go silent
+    // just because the bot is resting -- that would be indistinguishable from
+    // a crash every single night.
+    let owls = owls_mock().await;
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v10/channels/2/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"id":"1"}"#))
+        .mount(&discord)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = write_quiet_config(&dir, &owls.uri(), &discord.uri(), "00:00", "23:59");
+
+    let token = CancellationToken::new();
+    let handle = tokio::spawn(run(cfg_path, secrets(), token.clone()));
+    tokio::time::sleep(Duration::from_millis(3_000)).await;
+    token.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
+
+    let beats = discord
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().contains("/channels/2/"))
+        .count();
+    assert!(beats >= 1, "expected a quiet-hours heartbeat, saw {beats}");
+}
+
+#[tokio::test]
+async fn polls_normally_outside_quiet_hours() {
+    let owls = owls_mock().await;
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"id":"1"}"#))
+        .mount(&discord)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    // A one-minute window that almost certainly is not now.
+    let cfg_path = write_quiet_config(&dir, &owls.uri(), &discord.uri(), "03:00", "03:01");
+
+    let token = CancellationToken::new();
+    let handle = tokio::spawn(run(cfg_path, secrets(), token.clone()));
+    tokio::time::sleep(Duration::from_millis(3_000)).await;
+    token.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
+
+    assert!(
+        !owls.received_requests().await.unwrap().is_empty(),
+        "outside the window the bot must poll as usual"
+    );
+}

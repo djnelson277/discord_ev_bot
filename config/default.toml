@@ -9,6 +9,19 @@ min_ev_pct = 2.5
 poll_interval_secs = 60
 gating_refresh_secs = 3600
 
+# Quiet hours: the poller does not run at all between these local times, so the
+# window costs no API quota rather than merely withholding alerts. 02:30-09:30
+# is ~29% of the day.
+#
+# A named IANA zone, never a UTC offset -- an offset would silently shift the
+# whole window by an hour twice a year at daylight saving.
+#
+# On waking the bot re-seeds silently, so an overnight board does not arrive as
+# a burst of alerts at 09:30.
+timezone = "America/Denver"
+quiet_hours_start = "02:30"
+quiet_hours_end = "09:30"
+
 # How often the ops channel gets a "here is what I saw" report. Silence is this
 # bot's normal state, so the heartbeat is what distinguishes "watching, market
 # is tight" from "crashed". Absence of it is the alarm.

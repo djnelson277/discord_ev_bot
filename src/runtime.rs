@@ -16,7 +16,7 @@ use crate::config::{Config, ConfigError};
 use crate::dedupe::Suppressor;
 use crate::discord::publisher::{AlertQueue, DiscordPublisher, build_embed};
 use crate::gating::active_sports;
-use crate::obs::{heartbeat_message, quota_warning};
+use crate::obs::{Heartbeat, heartbeat_message, quota_warning};
 use crate::owls::client::OwlsClient;
 use crate::owls::quota::{Pacing, next_interval};
 use crate::poller::{PollContext, poll_once};
@@ -247,6 +247,7 @@ pub async fn run(
     let mut gating_due = Instant::now();
     let mut health_due = Instant::now();
     let mut gating_failures: u32 = 0;
+    let mut was_quiet = false;
     // Due immediately, so the first poll is followed straight away by a
     // heartbeat. Scheduling it a full interval out meant a fresh deploy went
     // quiet for 30 minutes -- precisely when the operator most needs
@@ -260,74 +261,96 @@ pub async fn run(
     while !shutdown.is_cancelled() {
         let cfg = cfg_rx.borrow().clone();
 
-        if Instant::now() >= gating_due {
-            match active_sports(&ctx.client, &cfg, Utc::now()).await {
-                Ok(active) => {
-                    info!(active = ?active, "gating refreshed");
-                    ctx.active = active;
-                    gating_failures = 0;
-                    gating_due = Instant::now() + Duration::from_secs(cfg.gating_refresh_secs);
-                }
-                Err(err) => {
-                    gating_failures += 1;
-                    warn!(
-                        error = %err,
-                        consecutive = gating_failures,
-                        "gating refresh failed; retrying sooner than the full interval"
-                    );
-                    // Retry soon, not in an hour. Keeping the previous set is
-                    // useless at boot, where it is empty -- the bot would poll
-                    // nothing, and the silence alarm is muted by an empty
-                    // active set, so nothing would report it.
-                    let backoff = GATING_RETRY_BASE
-                        .saturating_mul(1u32 << gating_failures.saturating_sub(1).min(10))
-                        .min(Duration::from_secs(cfg.gating_refresh_secs));
-                    gating_due = Instant::now() + backoff;
+        // Quiet hours skip gating AND polling, not just alerting. Suppressing
+        // only the alerts would still spend the whole window's quota for
+        // nothing; a 7-hour window is roughly 29% of the day's requests.
+        let quiet = cfg.is_quiet_at(Utc::now());
+        if quiet && !was_quiet {
+            info!(
+                until = cfg.quiet_until_label(),
+                "entering quiet hours; pausing polling"
+            );
+        }
+        if !quiet && was_quiet {
+            // Waking. Every price has moved overnight, so without clearing
+            // `seeded` the suppressor would treat the whole board as new and
+            // publish a morning dump. Re-seeding reuses the cold-start path.
+            info!("leaving quiet hours; re-seeding before alerts resume");
+            ctx.seeded.clear();
+            gating_due = Instant::now();
+        }
+        was_quiet = quiet;
 
-                    if gating_failures == GATING_FAILURES_BEFORE_ALARM {
-                        let msg = format!(
-                            "Gating has failed {gating_failures} times in a row ({err}). \
+        if !quiet {
+            if Instant::now() >= gating_due {
+                match active_sports(&ctx.client, &cfg, Utc::now()).await {
+                    Ok(active) => {
+                        info!(active = ?active, "gating refreshed");
+                        ctx.active = active;
+                        gating_failures = 0;
+                        gating_due = Instant::now() + Duration::from_secs(cfg.gating_refresh_secs);
+                    }
+                    Err(err) => {
+                        gating_failures += 1;
+                        warn!(
+                            error = %err,
+                            consecutive = gating_failures,
+                            "gating refresh failed; retrying sooner than the full interval"
+                        );
+                        // Retry soon, not in an hour. Keeping the previous set is
+                        // useless at boot, where it is empty -- the bot would poll
+                        // nothing, and the silence alarm is muted by an empty
+                        // active set, so nothing would report it.
+                        let backoff = GATING_RETRY_BASE
+                            .saturating_mul(1u32 << gating_failures.saturating_sub(1).min(10))
+                            .min(Duration::from_secs(cfg.gating_refresh_secs));
+                        gating_due = Instant::now() + backoff;
+
+                        if gating_failures == GATING_FAILURES_BEFORE_ALARM {
+                            let msg = format!(
+                                "Gating has failed {gating_failures} times in a row ({err}). \
                              Active sports: {}. While this persists the poller has nothing \
                              to poll.",
-                            if ctx.active.is_empty() {
-                                "none".to_string()
-                            } else {
-                                ctx.active.iter().cloned().collect::<Vec<_>>().join(", ")
+                                if ctx.active.is_empty() {
+                                    "none".to_string()
+                                } else {
+                                    ctx.active.iter().cloned().collect::<Vec<_>>().join(", ")
+                                }
+                            );
+                            warn!(warning = %msg, "health");
+                            if let Err(e) = ops_publisher.post_embed(&ops_embed(&msg)).await {
+                                error!(error = %e, "failed to publish gating alarm");
                             }
-                        );
-                        warn!(warning = %msg, "health");
-                        if let Err(e) = ops_publisher.post_embed(&ops_embed(&msg)).await {
-                            error!(error = %e, "failed to publish gating alarm");
                         }
                     }
                 }
             }
-        }
 
-        let outcome = poll_once(&mut ctx, &cfg, Instant::now()).await;
-        // Read the outcome, never the queue length. The publisher is a
-        // concurrent consumer that pops as soon as anything is queued, and
-        // poll_once awaits a network round-trip per sport, so an alert pushed
-        // while polling sport 1 of 10 is normally already sent by the time
-        // poll_once returns and the length is unchanged.
-        queued_since_heartbeat += outcome.published;
-        if let Some(best) = &outcome.best_ev {
-            if best_since_heartbeat
-                .as_ref()
-                .is_none_or(|b| best.ev_pct > b.ev_pct)
-            {
-                best_since_heartbeat = Some(best.clone());
+            let outcome = poll_once(&mut ctx, &cfg, Instant::now()).await;
+            // Read the outcome, never the queue length. The publisher is a
+            // concurrent consumer that pops as soon as anything is queued, and
+            // poll_once awaits a network round-trip per sport, so an alert pushed
+            // while polling sport 1 of 10 is normally already sent by the time
+            // poll_once returns and the length is unchanged.
+            queued_since_heartbeat += outcome.published;
+            if let Some(best) = &outcome.best_ev {
+                if best_since_heartbeat
+                    .as_ref()
+                    .is_none_or(|b| best.ev_pct > b.ev_pct)
+                {
+                    best_since_heartbeat = Some(best.clone());
+                }
             }
-        }
-        info!(
-            polled = outcome.polled,
-            published = outcome.published,
-            suppressed = outcome.suppressed,
-            rejected = outcome.rejected,
-            stale = outcome.stale_boards,
-            errors = outcome.errors,
-            "poll complete"
-        );
+            info!(
+                polled = outcome.polled,
+                published = outcome.published,
+                suppressed = outcome.suppressed,
+                rejected = outcome.rejected,
+                stale = outcome.stale_boards,
+                errors = outcome.errors,
+                "poll complete"
+            );
+        } // end !quiet
 
         let quota = ctx.client.quota();
         let day = Utc::now().day();
@@ -345,14 +368,15 @@ pub async fn run(
         // the two states the operator most needs told apart.
         if Instant::now() >= heartbeat_due {
             let delivered_total = delivered.load(Ordering::Relaxed);
-            let msg = heartbeat_message(
-                &ctx.active,
-                best_since_heartbeat.take(),
-                cfg.min_ev_pct,
-                queued_since_heartbeat,
-                delivered_total.saturating_sub(delivered_at_last_heartbeat),
-                &quota,
-            );
+            let msg = heartbeat_message(Heartbeat {
+                active: &ctx.active,
+                best: best_since_heartbeat.take(),
+                threshold_pct: cfg.min_ev_pct,
+                queued: queued_since_heartbeat,
+                delivered: delivered_total.saturating_sub(delivered_at_last_heartbeat),
+                quota: &quota,
+                quiet_until: if quiet { cfg.quiet_until_label() } else { None },
+            });
             info!(heartbeat = %msg, "heartbeat");
             if let Err(err) = ops_publisher.post_embed(&heartbeat_embed(&msg)).await {
                 error!(error = %err, "failed to publish heartbeat");
