@@ -161,3 +161,68 @@ fn rejects_an_out_of_range_lookahead() {
     assert!(Config::from_toml_str("lookahead_hours = 0\n").is_err());
     assert!(Config::from_toml_str("lookahead_hours = 10000\n").is_err());
 }
+
+#[test]
+fn accepts_any_book_the_api_can_actually_serve() {
+    // The allowlist constant used to hold the operator's CURRENT selection, so
+    // adding a book they had signed up for meant editing Rust, committing and
+    // redeploying -- which contradicts the rule that operator criteria are
+    // runtime-changeable. It now holds the API's book universe, and the
+    // operator's narrower choice lives in config where it belongs.
+    let _g = guard();
+    for book in [
+        "caesars",
+        "circa",
+        "bovada",
+        "hardrock",
+        "betr",
+        "wynn",
+        "stations",
+        "south_point",
+        "westgate",
+        "1xbet",
+    ] {
+        assert!(
+            Config::from_toml_str(&format!("books = [\"{book}\"]\n")).is_ok(),
+            "{book} is on the consensus board and must be configurable without a code change"
+        );
+    }
+}
+
+#[test]
+fn still_rejects_a_book_the_api_does_not_serve() {
+    // The validation earns its place by catching typos; widening it must not
+    // turn it into a rubber stamp.
+    let _g = guard();
+    for bogus in ["betfair", "draftking", "fanduell", "caesers"] {
+        let err = Config::from_toml_str(&format!("books = [\"{bogus}\"]\n")).unwrap_err();
+        assert!(err.to_string().contains(bogus), "got: {err}");
+    }
+}
+
+#[test]
+fn rejects_pinnacle_with_an_explanation_not_just_unknown() {
+    // Pinnacle is a real key, so "unknown book" would be actively misleading.
+    // It is the fair-value anchor: it can never be offered as value against
+    // itself, so configuring it is always a mistake worth explaining.
+    let _g = guard();
+    let err = Config::from_toml_str("books = [\"pinnacle\"]\n").unwrap_err();
+    let msg = err.to_string().to_lowercase();
+    assert!(msg.contains("pinnacle"), "got: {err}");
+    assert!(
+        msg.contains("fair") || msg.contains("anchor"),
+        "must explain WHY, not just refuse: {err}"
+    );
+}
+
+#[test]
+fn the_shipped_config_includes_caesars_and_circa() {
+    let _g = guard();
+    let cfg = Config::load(Path::new("config/default.toml")).unwrap();
+    for b in ["caesars", "circa"] {
+        assert!(
+            cfg.books.iter().any(|x| x == b),
+            "{b} missing from shipped config"
+        );
+    }
+}

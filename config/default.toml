@@ -22,9 +22,18 @@ sports = [
   "ncaab", "wnba", "soccer", "tennis", "mma",
 ]
 
+# Books the operator holds funded accounts at. Alerting on a book you cannot
+# bet is noise that trains people to ignore the channel.
+#
+# Adding one is a config change only -- the code validates against the API's
+# book universe, not against this list.
 books = [
-  "betmgm", "fanduel", "draftkings", "bet365",
+  "betmgm", "fanduel", "draftkings", "caesars", "circa",
   "novig", "kalshi", "polymarket",
+  # bet365 is absent from the consensus /odds board in live sampling, so the
+  # poller may never be able to alert on it, even though the ev.found webhook
+  # allowlist accepts it. Left in pending confirmation.
+  "bet365",
 ]
 
 # Optional. When set, opportunities with a known lower consensus count are

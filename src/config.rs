@@ -18,17 +18,48 @@ pub const EV_SPORTS: [&str; 14] = [
     "valorant", "wnba",
 ];
 
-/// The books this operator holds funded accounts at. Alerting on anything else
-/// is noise that trains people to ignore the channel.
-pub const ALLOWED_BOOKS: [&str; 7] = [
+/// Book keys that can appear as an EV opportunity — a fact about the API, not
+/// a preference.
+///
+/// This deliberately does NOT encode which books the operator uses; that is
+/// `Config::books`, which belongs in config so adding a newly-opened account is
+/// a one-line change rather than a code edit and redeploy. This list exists
+/// only to catch typos like `betfair` or `caesers`.
+///
+/// Sampled from the live consensus `/odds` board across six sports, plus the
+/// two prediction markets that require `venues=true`. Books outside it are v2
+/// Source API only: raw per-book feeds with no EV computed, so configuring one
+/// could never produce an alert.
+pub const EV_CAPABLE_BOOKS: [&str; 18] = [
+    // consensus board
+    "1xbet",
     "betmgm",
-    "fanduel",
+    "betr",
+    "bovada",
+    "caesars",
+    "circa",
     "draftkings",
-    "bet365",
+    "fanduel",
+    "hardrock",
     "novig",
+    "south_point",
+    "stations",
+    "westgate",
+    "wynn",
+    // accepted by the ev.found webhook allowlist, though absent from the
+    // consensus board sample — may not be reachable via the poller
+    "bet365",
+    // prediction markets, require venues=true
     "kalshi",
     "polymarket",
+    // the fair-value anchor; rejected with its own message below
+    "pinnacle",
 ];
+
+/// Pinnacle is the fair every other price is scored against, so it can never be
+/// offered as value against itself. Configuring it is always a mistake, and
+/// "unknown book" would be a misleading way to say so.
+pub const FAIR_ANCHOR_BOOK: &str = "pinnacle";
 
 /// Floor on the poll interval. A zero or near-zero value turns the main loop
 /// into a tight request loop: measured at ~32,000 requests/minute against a
@@ -59,8 +90,13 @@ pub enum ConfigError {
     Read(#[from] figment::Error),
     #[error("unknown sport {sport:?} — the EV endpoint serves only: {}", EV_SPORTS.join(", "))]
     UnknownSport { sport: String },
-    #[error("unknown book {book:?} — configured books must be among: {}", ALLOWED_BOOKS.join(", "))]
+    #[error("unknown book {book:?} — configurable books are: {}", EV_CAPABLE_BOOKS.join(", "))]
     UnknownBook { book: String },
+    #[error(
+        "{book:?} is the fair-value anchor every other price is scored against, so it can \
+         never itself be an opportunity — remove it from `books`"
+    )]
+    FairAnchorBook { book: String },
     #[error("{field} must be at least {min}, got {got}")]
     TooSmall {
         field: &'static str,
@@ -152,7 +188,21 @@ fn default_sports() -> Vec<String> {
     .collect()
 }
 fn default_books() -> Vec<String> {
-    ALLOWED_BOOKS.iter().map(|s| s.to_string()).collect()
+    // Only used when a partial TOML omits `books`; the shipped config is
+    // authoritative for what the operator actually holds.
+    [
+        "betmgm",
+        "fanduel",
+        "draftkings",
+        "caesars",
+        "circa",
+        "novig",
+        "kalshi",
+        "polymarket",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 impl Config {
@@ -253,10 +303,13 @@ impl Config {
                 sport: sport.clone(),
             });
         }
+        if let Some(book) = self.books.iter().find(|b| b.as_str() == FAIR_ANCHOR_BOOK) {
+            return Err(ConfigError::FairAnchorBook { book: book.clone() });
+        }
         if let Some(book) = self
             .books
             .iter()
-            .find(|b| !ALLOWED_BOOKS.contains(&b.as_str()))
+            .find(|b| !EV_CAPABLE_BOOKS.contains(&b.as_str()))
         {
             return Err(ConfigError::UnknownBook { book: book.clone() });
         }
