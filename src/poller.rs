@@ -126,6 +126,9 @@ pub async fn poll_once(ctx: &mut PollContext, cfg: &Config, now_mono: Instant) -
     // sport re-seed silently rather than republish its whole board.
     ctx.suppressor.retain_sports(&ctx.active);
     ctx.seeded.retain(|s| ctx.active.contains(s));
+    // Re-armed keys are retained rather than deleted so the re-alert floor can
+    // be enforced, so something must bound the map.
+    ctx.suppressor.evict_expired(now_mono);
 
     let sports: Vec<String> = ctx.active.iter().cloned().collect();
 

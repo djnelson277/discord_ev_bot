@@ -140,7 +140,9 @@ fn window_expiry_republishes_the_same_price() {
 
 #[test]
 fn rearms_after_two_consecutive_absences() {
-    // The price going away and coming back is a genuinely new crossing.
+    // A price that went away and came back is a genuinely new crossing -- but
+    // only once the 15-minute floor has passed. This test previously used 300s
+    // and encoded the bug that let a flickering price alert every few minutes.
     let mut s = sup();
     let start = t0();
     s.observe(&key(), 4.0, start);
@@ -148,6 +150,11 @@ fn rearms_after_two_consecutive_absences() {
     s.mark_absent_in_sport("nba", &HashSet::new());
     assert_eq!(
         s.observe(&key(), 4.0, start + Duration::from_secs(300)),
+        Decision::Suppress,
+        "five minutes is inside the floor"
+    );
+    assert_eq!(
+        s.observe(&key(), 4.0, start + Duration::from_secs(16 * 60)),
         Decision::Publish
     );
 }
@@ -222,20 +229,23 @@ fn keys_are_independent_across_sides() {
 
 #[test]
 fn tracked_key_count_is_observable() {
-    // The poller needs this to log state size; an unbounded map would be a leak.
+    // The poller logs this; an unbounded map would be a leak.
     let mut s = sup();
     let start = t0();
     s.observe(&key(), 4.0, start);
     s.observe(&other_key(), 4.0, start);
     assert_eq!(s.tracked(), 2);
 
+    // Absence now RE-ARMS rather than deleting. Retaining the entry is the
+    // point: last_published_at is what enforces the 15-minute floor, and
+    // deleting it was how a flickering price bypassed the floor entirely.
     s.mark_absent_in_sport("nba", &HashSet::new());
     s.mark_absent_in_sport("nba", &HashSet::new());
-    assert_eq!(
-        s.tracked(),
-        0,
-        "re-armed keys must be dropped, not retained"
-    );
+    assert_eq!(s.tracked(), 2, "re-armed keys are retained, not dropped");
+
+    // evict_expired is what bounds the map instead.
+    s.evict_expired(start + WINDOW + Duration::from_secs(60));
+    assert_eq!(s.tracked(), 0);
 }
 
 #[test]
@@ -295,4 +305,85 @@ fn mark_absent_must_not_age_keys_belonging_to_other_sports() {
         3,
         "no key may be evicted while its own sport was observed this cycle"
     );
+}
+
+#[test]
+fn rearming_does_not_bypass_the_minimum_realert_interval() {
+    // REGRESSION. Observed in production: the same DraftKings price alerted at
+    // 03:16, 03:38 and 03:53 with an identical 9.26% EV, and another at 06:02,
+    // 06:11 and 06:30 at 2.77%.
+    //
+    // Cause: mark_absent_in_sport DELETED the key after two absences, so the
+    // next observation saw an unknown key and published with no time check at
+    // all. A price that flickers out of the board for two polls -- routine for
+    // an obscure tennis market -- could therefore re-alert every couple of
+    // minutes, bypassing the 2-hour window entirely.
+    //
+    // The server's own rule has a floor this implementation was missing:
+    // "at most once per 15 minutes for one event, venue and side".
+    let mut s = sup();
+    let start = t0();
+
+    assert_eq!(s.observe(&key(), 9.26, start), Decision::Publish);
+
+    // price drops off the board for two polls, then returns unchanged
+    s.mark_absent_in_sport("nba", &HashSet::new());
+    s.mark_absent_in_sport("nba", &HashSet::new());
+
+    assert_eq!(
+        s.observe(&key(), 9.26, start + Duration::from_secs(120)),
+        Decision::Suppress,
+        "a flickering price must not re-alert two minutes later"
+    );
+    assert_eq!(
+        s.observe(&key(), 9.26, start + Duration::from_secs(14 * 60)),
+        Decision::Suppress,
+        "still inside the 15-minute floor"
+    );
+}
+
+#[test]
+fn a_rearmed_price_may_alert_again_once_the_floor_has_passed() {
+    // The re-arm is still meaningful: a price that genuinely went away and came
+    // back is a new crossing. It just cannot happen every two minutes.
+    let mut s = sup();
+    let start = t0();
+    s.observe(&key(), 9.26, start);
+    s.mark_absent_in_sport("nba", &HashSet::new());
+    s.mark_absent_in_sport("nba", &HashSet::new());
+
+    assert_eq!(
+        s.observe(&key(), 9.26, start + Duration::from_secs(16 * 60)),
+        Decision::Publish,
+        "past the floor, a returning price is a genuine new crossing"
+    );
+}
+
+#[test]
+fn a_material_rise_still_beats_the_floor() {
+    // A price improving by a full point is the one thing worth interrupting
+    // for, exactly as the server treats it.
+    let mut s = sup();
+    let start = t0();
+    s.observe(&key(), 4.0, start);
+    assert_eq!(
+        s.observe(&key(), 5.5, start + Duration::from_secs(60)),
+        Decision::Publish
+    );
+}
+
+#[test]
+fn absent_keys_are_still_eventually_evicted() {
+    // Retaining state instead of deleting it must not turn the map into a leak.
+    let mut s = sup();
+    let start = t0();
+    s.observe(&key(), 4.0, start);
+    assert_eq!(s.tracked(), 1);
+
+    // absent, and long past the suppression window
+    for _ in 0..4 {
+        s.mark_absent_in_sport("nba", &HashSet::new());
+    }
+    s.evict_expired(start + WINDOW + Duration::from_secs(60));
+    assert_eq!(s.tracked(), 0, "stale absent keys must not accumulate");
 }

@@ -34,6 +34,15 @@ use crate::owls::models::Side;
 /// re-armed every time it blinked would defeat the whole mechanism.
 const ABSENCES_TO_REARM: u32 = 2;
 
+/// Minimum time between two alerts for the same key, whatever else happens.
+///
+/// Mirrors the server's own floor: "at most once per 15 minutes for one event,
+/// venue and side". Without it, a price that flickers off the board for two
+/// polls re-arms and can alert again within minutes — observed in production as
+/// the same DraftKings price posting three times in 37 minutes at an identical
+/// 9.26% EV. Only a material rise overrides this.
+const MIN_REALERT: Duration = Duration::from_secs(15 * 60);
+
 /// Identity of one alertable opportunity.
 ///
 /// `event_id` is `EvEvent::dedupe_key()` — the canonical `sport:away@home-date`
@@ -65,6 +74,13 @@ struct State {
     last_published_ev: f64,
     last_published_at: Instant,
     absent_polls: u32,
+    /// Set once the price has been missing long enough to count as a new
+    /// crossing when it returns.
+    ///
+    /// A flag rather than deleting the entry: deletion threw away
+    /// `last_published_at`, which is what enforces [`MIN_REALERT`]. Keeping the
+    /// state is what stops a flickering price re-alerting every two minutes.
+    rearmed: bool,
 }
 
 pub struct Suppressor {
@@ -102,6 +118,7 @@ impl Suppressor {
                 last_published_ev: ev,
                 last_published_at: now,
                 absent_polls: 0,
+                rearmed: false,
             },
         );
     }
@@ -112,8 +129,15 @@ impl Suppressor {
             // Never seen, or re-armed after going away: a genuine new crossing.
             None => Decision::Publish,
             Some(state) => {
-                let window_expired = now.duration_since(state.last_published_at) >= self.window;
-                if window_expired || self.is_material_rise(state.last_published_ev, ev) {
+                let since = now.duration_since(state.last_published_at);
+                // A real improvement is the one thing worth interrupting for,
+                // and it overrides every floor — same as the server.
+                if self.is_material_rise(state.last_published_ev, ev) {
+                    Decision::Publish
+                } else if since < MIN_REALERT {
+                    // Nothing re-alerts inside the floor, re-armed or not.
+                    Decision::Suppress
+                } else if state.rearmed || since >= self.window {
                     Decision::Publish
                 } else {
                     Decision::Suppress
@@ -129,6 +153,7 @@ impl Suppressor {
                         last_published_ev: ev,
                         last_published_at: now,
                         absent_polls: 0,
+                        rearmed: false,
                     },
                 );
             }
@@ -178,11 +203,26 @@ impl Suppressor {
             }
             if seen_this_poll.contains(key) {
                 state.absent_polls = 0;
-                true
             } else {
                 state.absent_polls += 1;
-                state.absent_polls < ABSENCES_TO_REARM
+                if state.absent_polls >= ABSENCES_TO_REARM {
+                    // Re-armed, not forgotten. Deleting the entry here is what
+                    // let a flickering price bypass MIN_REALERT entirely.
+                    state.rearmed = true;
+                }
             }
+            true
+        });
+    }
+
+    /// Drops entries that are absent and older than the suppression window.
+    ///
+    /// Required because `mark_absent_in_sport` no longer deletes on re-arm, so
+    /// something else has to bound the map.
+    pub fn evict_expired(&mut self, now: Instant) {
+        let window = self.window;
+        self.seen.retain(|_, state| {
+            state.absent_polls == 0 || now.duration_since(state.last_published_at) < window
         });
     }
 
