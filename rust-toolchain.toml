@@ -2,11 +2,15 @@
 # Build images often ship something older, and the failure is a confusing
 # edition error rather than an obvious "your Rust is too old".
 #
-# rust-analyzer is listed explicitly so editors use the toolchain's own copy
-# rather than whatever the extension bundles. Without it, VS Code warns that
-# the pinned toolchain is too old for its shipped rust-analyzer and falls back,
-# which costs you autocomplete and inline diagnostics.
+# Keep this reasonably current. It was briefly pinned to 1.92, which by then was
+# eleven months and nine releases old -- chosen by mistake from whatever happened
+# to be installed locally rather than from what was actually current. Editors
+# ship a modern rust-analyzer and refuse to use an ancient toolchain's, so the
+# stale pin cost working autocomplete and inline diagnostics until it surfaced.
+#
+# rust-analyzer, rustfmt and clippy are listed explicitly because
+# `profile = "minimal"` omits all three.
 [toolchain]
-channel = "1.92"
+channel = "1.99"
 profile = "minimal"
 components = ["rust-analyzer", "rustfmt", "clippy"]

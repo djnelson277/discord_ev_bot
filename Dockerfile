@@ -3,7 +3,7 @@
 # ./target/release/, which does not exist in the runtime image, and the service
 # crash-looped.
 
-FROM rust:1.92-slim-bookworm AS builder
+FROM rust:1.99-slim-bookworm AS builder
 
 WORKDIR /app
 
